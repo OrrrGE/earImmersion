@@ -2,9 +2,10 @@ name: build
 on:
   push:
     tags: ['v*']
+    branches: ['fix-*']
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 jobs:
   build:
     strategy:
@@ -17,53 +18,158 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Smoke test (real system calls on this OS)
-        continue-on-error: true
+      - run: pip install pyinstaller pillow
+
+      - name: End-to-end test, from source
         shell: bash
         run: |
-          cd desktop && python -X utf8 -c "
-          import sys, speak
-          P = speak.Windows if sys.platform == 'win32' else speak.Mac
-          p = P(lambda: 0, lambda: 0)
-          print('mouse', p.mouse(), 'ibeam', p.ibeam())
-          p.show(100, 100); p.say('test 测试'); p.root.update(); print('box', p.box()); p.hide()
-          v = speak.voice('plaid'); print('voice', v); print('mean', speak.lookup('plaid'))
-          if v: p.play(v); p.stop()
-          print('SMOKE OK')"
-      - run: pip install pyinstaller
+          python -X utf8 tests/e2e.py python desktop/speak.py
+          mv e2e e2e-source
+
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          pyinstaller --onefile --noconsole --name earImmersion desktop/speak.py
+          pyinstaller --onefile --noconsole --name earImmersion --icon desktop/icon.png desktop/speak.py
           cp dist/earImmersion.exe earImmersion-${{ matrix.name }}.exe
+          echo "APP=dist/earImmersion.exe" >> "$GITHUB_ENV"
       - name: Build (macOS)
         if: runner.os == 'macOS'
         run: |
-          pyinstaller --windowed --name earImmersion --osx-bundle-identifier io.github.earimmersion desktop/speak.py
-          /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" dist/earImmersion.app/Contents/Info.plist
+          pyinstaller --windowed --name earImmersion --icon desktop/icon.png --osx-bundle-identifier io.github.orrrge.earimmersion desktop/speak.py
           codesign --force --deep -s - dist/earImmersion.app
           ditto -c -k --keepParent dist/earImmersion.app earImmersion-${{ matrix.name }}.zip
+          echo "APP=dist/earImmersion.app/Contents/MacOS/earImmersion" >> "$GITHUB_ENV"
+
+      - name: End-to-end test, the packaged app
+        shell: bash
+        run: python -X utf8 tests/e2e.py "$APP"
+
+      - name: Does Microsoft Defender flag the exe? (Windows)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          Get-Service WinDefend | Format-Table Name, Status, StartType
+          & $mp -SignatureUpdate
+          Get-MpComputerStatus | Format-List AMServiceEnabled, AntivirusEnabled, RealTimeProtectionEnabled, AntivirusSignatureVersion, AntivirusSignatureLastUpdated
+          & $mp -Scan -ScanType 3 -File (Resolve-Path dist\earImmersion.exe).Path -DisableRemediation
+          "defender exit code: $LASTEXITCODE  (0 = nothing found, 2 = threat found)"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-${{ matrix.name }}
+          path: e2e*/
       - uses: actions/upload-artifact@v4
         with:
           name: earImmersion-${{ matrix.name }}
           path: earImmersion-${{ matrix.name }}.*
-      - name: Publish to release
-        if: startsWith(github.ref, 'refs/tags/')
+
+  # GitHub 的 Windows 机器没有声卡，所以"点了有没有声音"单独在这里测：装一个虚拟声卡，再拿上面打包出来的 exe 跑一遍。
+  # 第三方的声卡驱动只装在这台测试用的机器上，不碰用来打包发布的那台。
+  windows-sound:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pillow
+      - uses: actions/download-artifact@v4
+        with:
+          name: earImmersion-windows-x64
+      - name: Install a virtual sound card (VB-CABLE)
+        continue-on-error: true
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          function Devices { [int](python -c "import ctypes; print(ctypes.WinDLL('winmm').waveOutGetNumDevs())") }
+          Get-Service Audiosrv, AudioEndpointBuilder | Format-Table Name, Status, StartType
+          $state = powershell -NoProfile -Command "(Get-WindowsFeature Server-Media-Foundation).InstallState"
+          "Server-Media-Foundation: $state"
+          if ("$state" -ne 'Installed') {   # 服务器版 Windows 默认不带家用版自带的媒体组件（解码 mp3 要用）
+            powershell -NoProfile -Command "Install-WindowsFeature Server-Media-Foundation | Format-List Success, RestartNeeded, ExitCode"
+          }
+          "wave out devices at first: $(Devices)"
+          $ok = $false
+          foreach ($try in 1..3) {
+            try {
+              Invoke-WebRequest https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip -OutFile vbcable.zip -TimeoutSec 120
+              $ok = $true; break
+            } catch { "download attempt $try failed: $_"; Start-Sleep 5 }
+          }
+          if (-not $ok) { '::warning::could not download VB-CABLE, playback will not be tested'; exit 0 }
+          $hash = (Get-FileHash vbcable.zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne 'b950e39f01af1d04ea623c8f6d8eb9b6ea5c477c637295fabf20631c85116bfb') {
+            "::warning::VB-CABLE package changed (sha256 $hash), not installing it; playback will not be tested"; exit 0
+          }
+          Expand-Archive vbcable.zip vbcable
+          $sig = Get-AuthenticodeSignature vbcable\vbaudio_cable64_win10.cat
+          $sig | Format-List Status, StatusMessage
+          $sig.SignerCertificate | Format-List Subject, Issuer, NotAfter
+          $store = [System.Security.Cryptography.X509Certificates.X509Store]::new('TrustedPublisher', 'LocalMachine')
+          $store.Open('ReadWrite'); $store.Add($sig.SignerCertificate); $store.Close()
+          $p = Start-Process vbcable\VBCABLE_Setup_x64.exe -ArgumentList '-i', '-h' -PassThru
+          if ($p.WaitForExit(150000)) { "setup exit code: $($p.ExitCode)" } else { 'setup still running after 150 s, stopping it'; $p.Kill() }
+          Start-Sleep 5
+          Restart-Service Audiosrv -Force -ErrorAction Continue
+          Start-Sleep 3
+          Get-PnpDevice -Class MEDIA -ErrorAction SilentlyContinue | Format-Table FriendlyName, Status, Problem
+          Get-CimInstance Win32_SoundDevice | Format-Table Name, Status
+          "wave out devices now: $(Devices)"
+          if ((Devices) -eq 0) { '::warning::no sound device after installing VB-CABLE, playback will not be tested' }
+      - name: End-to-end test with sound, the packaged exe
         shell: bash
+        run: python -X utf8 tests/e2e.py ./earImmersion-windows-x64.exe
+      # 国内常见的情况：Windows 用户名是中文，于是下载目录、临时目录、数据目录的路径里都有中文和空格
+      - name: End-to-end test again, with Chinese characters and spaces in every path
+        shell: pwsh
+        run: |
+          Rename-Item e2e e2e-plain
+          $base = Join-Path $env:RUNNER_TEMP '中文 用户名'
+          New-Item -ItemType Directory -Force "$base\下载", "$base\AppData\Local\Temp" | Out-Null
+          Copy-Item earImmersion-windows-x64.exe "$base\下载\"
+          $env:LOCALAPPDATA = "$base\AppData\Local"
+          $env:TEMP = "$base\AppData\Local\Temp"
+          $env:TMP = $env:TEMP
+          python -X utf8 tests/e2e.py "$base\下载\earImmersion-windows-x64.exe"
+          $code = $LASTEXITCODE
+          Get-ChildItem "$base\AppData\Local" -Recurse -Depth 2 | ForEach-Object { $_.FullName.Substring($base.Length) }
+          exit $code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-windows-sound
+          path: e2e*/
+
+  publish:
+    needs: [build, windows-sound]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: earImmersion-*
+          merge-multiple: true
+          path: out
+      - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes 2>/dev/null || true
-          gh release upload "$GITHUB_REF_NAME" earImmersion-${{ matrix.name }}.* --clobber
-      - name: Pack extension
-        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'Windows'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          cd extension && 7z a ../earImmersion-extension.zip . && cd ..
-          gh release upload "$GITHUB_REF_NAME" earImmersion-extension.zip --clobber
+          (cd extension && zip -qr ../out/earImmersion-extension.zip .)
+          ls -la out
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes out/*
