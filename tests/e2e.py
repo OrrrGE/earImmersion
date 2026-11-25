@@ -2,6 +2,9 @@
 
 用法：python tests/e2e.py <启动程序的命令…>        （Windows / macOS / Linux-X11 通用）
 截图和结果写到 ./e2e/。设 E2E_SOFT=1 时只报告，不因检查失败而返回非零。
+
+释义和发音来自外部的词典服务。如果只有这几项没过，而测试进程自己（对照实验）也连不上词典服务，
+说明是这台机器的网络问题而不是程序的问题：等一分钟整个重跑一遍，以重跑的结果为准。
 """
 import ctypes
 import json
@@ -10,7 +13,9 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
+from urllib.request import Request, urlopen
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.abspath('e2e')
@@ -275,10 +280,28 @@ class Log:
         return None
 
 
-def check(name, ok, info='', hard=True):
-    checks.append({'name': name, 'ok': bool(ok), 'hard': hard, 'info': str(info)})
+def check(name, ok, info='', hard=True, net=False):
+    """hard=False：这台机器上没法验证的项目（比如没有声卡）；net=True：结果取决于外部的词典服务。"""
+    checks.append({'name': name, 'ok': bool(ok), 'hard': hard, 'net': net, 'info': str(info)})
     print('%s %s %s' % ('PASS' if ok else ('FAIL' if hard else 'WARN'), name, '' if info is None else info), flush=True)
     return bool(ok)
+
+
+def reachable(patience=12):
+    """对照实验：测试进程自己现在连不连得上词典服务。连得上返回 True，否则返回原因。"""
+    out = []
+
+    def go():
+        try:
+            req = Request('https://dict.youdao.com/dictvoice?audio=test&type=2', headers={'User-Agent': 'Mozilla/5.0'})
+            with urlopen(req, timeout=8) as r:
+                out.append(len(r.read()) > 500 or 'unexpected answer')
+        except Exception as e:
+            out.append(repr(e))
+    t = threading.Thread(target=go, daemon=True)    # 域名解析卡住时 urlopen 的超时不管用，所以放到线程里限时
+    t.start()
+    t.join(patience)
+    return out[0] if out else 'no answer within %d seconds' % patience
 
 
 def glide(d, x, y, steps=8):
@@ -343,13 +366,17 @@ def speak(d, log, x, y, name, chars):
         check(name + '：点喇叭后，前台仍是文档', d.doc_front(), d.front())
         check(name + '：剪贴板已还原', d.clipboard() == SENTINEL, repr(d.clipboard()[:40]))
         check(name + '：模拟"复制"之后没有留下按着的修饰键', not d.mods(), d.mods())
-    check(name + '：取到了释义', ' mean ok' in new)
-    check(name + '：下载到了发音', ' voice ok' in new or played)
+    got = [check(name + '：取到了释义', ' mean ok' in new, net=True),
+           check(name + '：下载到了发音', ' voice ok' in new or played, net=True)]
     # 没有声卡的机器上放不出声音，这一项只能跳过
-    check(name + '：播放了发音', played and played.group(1) == 'ok', played and played.group(0), hard=d.audio)
+    check(name + '：播放了发音', played and played.group(1) == 'ok', played and played.group(0), hard=d.audio, net=True)
     if isinstance(d, Win):
         m = re.search(r' playing: mode=(\w+) position=(\d+)/(\d+)', new)
-        check(name + '：播放进度在走', m and int(m.group(2)) > 0, m and m.group(0), hard=d.audio)
+        check(name + '：播放进度在走', m and int(m.group(2)) > 0, m and m.group(0), hard=d.audio, net=True)
+    if not all(got) and not d.offline:
+        answer = reachable()
+        print('control: can the test itself reach the dictionary service right now? %s' % answer, flush=True)
+        d.offline = answer is not True
 
 
 def run(d, log, pos, cmd, t0):
@@ -489,12 +516,10 @@ def run(d, log, pos, cmd, t0):
         check('收到退出请求后程序退出', answer.startswith(b'earImmersion') and log.wait(r' quit', 10), answer)
 
 
-def main():
-    cmd = sys.argv[1:]
-    os.makedirs(OUT, exist_ok=True)
-    d = Win() if sys.platform == 'win32' else Mac() if sys.platform == 'darwin' else X11()
-    d.at = (5, 5)
-    print('this machine can play sound:', d.audio, flush=True)
+def attempt(d, cmd):
+    """完整地跑一遍：开文档窗口、启动程序、逐项检查、收尾。"""
+    del checks[:]
+    d.at, d.offline = (5, 5), False
     log = Log(os.path.join(d.data_dir(), 'log.txt'))
     try:
         os.remove(log.path)
@@ -538,11 +563,26 @@ def main():
             subprocess.run(['pkill', '-f', 'earImmersion.app/Contents/MacOS/earImmersion'], capture_output=True)
         with open(os.path.join(OUT, 'result.json'), 'w', encoding='utf-8') as f:
             json.dump(checks, f, ensure_ascii=False, indent=1)
-    failed = [c['name'] for c in checks if not c['ok'] and c['hard']]
+    failed = [c for c in checks if not c['ok'] and c['hard']]
     skipped = [c['name'] for c in checks if not c['ok'] and not c['hard']]
-    print('\n%d checks, %d failed%s' % (len(checks), len(failed), ': ' + '; '.join(failed) if failed else ''), flush=True)
+    print('\n%d checks, %d failed%s' % (len(checks), len(failed),
+                                        ': ' + '; '.join(c['name'] for c in failed) if failed else ''), flush=True)
     if skipped:
         print('could not be verified on this machine: ' + '; '.join(skipped), flush=True)
+    return failed
+
+
+def main():
+    cmd = sys.argv[1:]
+    os.makedirs(OUT, exist_ok=True)
+    d = Win() if sys.platform == 'win32' else Mac() if sys.platform == 'darwin' else X11()
+    print('this machine can play sound:', d.audio, flush=True)
+    failed = attempt(d, cmd)
+    if failed and d.offline and all(c['net'] for c in failed):
+        print('\nOnly the lookups failed, and the test itself could not reach the dictionary service either:\n'
+              'that is this machine\'s network, not the app. Running everything once more in a minute.\n', flush=True)
+        time.sleep(60)
+        failed = attempt(d, cmd)
     sys.exit(1 if failed and not SOFT else 0)
 
 
