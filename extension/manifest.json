@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "磨耳朵 · 划词发音",
+  "version": "1.0.0",
+  "description": "选中英文后出现小喇叭，点击听标准发音并显示中文释义，支持多词。",
+  "host_permissions": ["https://dict.youdao.com/*", "https://fanyi.baidu.com/*"],
+  "background": { "service_worker": "bg.js", "scripts": ["bg.js"] },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "all_frames": true,
+      "match_about_blank": true,
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_specific_settings": { "gecko": { "id": "moerduo@local", "strict_min_version": "127.0" } }
+}
