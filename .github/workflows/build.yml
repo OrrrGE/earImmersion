@@ -102,6 +102,12 @@ jobs:
             powershell -NoProfile -Command "Install-WindowsFeature Server-Media-Foundation | Format-List Success, RestartNeeded, ExitCode"
           }
           "wave out devices at first: $(Devices)"
+          # 测试要从虚拟声卡上把程序放出来的声音录回来；服务器版 Windows 默认不让桌面程序录音
+          foreach ($hive in 'HKLM', 'HKCU') {
+            $key = "$hive\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"
+            reg add $key /v Value /d Allow /f | Out-Null
+            reg add "$key\NonPackaged" /v Value /d Allow /f | Out-Null
+          }
           $ok = $false
           foreach ($try in 1..3) {
             try {
@@ -152,6 +158,58 @@ jobs:
         with:
           name: e2e-windows-sound
           path: e2e*/
+
+  # 高分屏：把测试机的屏幕调成 1920x1080、缩放 150%，再跑一遍，核对喇叭的大小和清晰度（逐像素）。
+  # 调缩放用的是没有写进文档的系统调用，测试机上不一定调得动，所以这一项不拦发布，结果只供参考。
+  windows-hidpi:
+    needs: build
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pillow
+      - uses: actions/download-artifact@v4
+        with:
+          name: earImmersion-windows-x64
+      - name: Switch the screen to 1920x1080 at 150 % scaling
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Set-DisplayResolution -Width 1920 -Height 1080 -Force
+          Start-Sleep 3
+          python tests/dpi.py 2
+      - name: End-to-end test at this scaling, the packaged exe
+        shell: bash
+        run: python -X utf8 tests/e2e.py ./earImmersion-windows-x64.exe
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-windows-hidpi
+          path: e2e*/
+
+  # 浏览器插件：在真实的 Firefox 里用鼠标选词、点喇叭，核对卡片上的字和播放的过程。
+  # 测试机没有声卡，浏览器也可能换版本，所以这一项不拦发布，结果只供参考。
+  extension:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node tests/ext.mjs firefox ext-firefox
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ext-firefox
+          path: ext-firefox/
 
   publish:
     needs: [build, windows-sound]

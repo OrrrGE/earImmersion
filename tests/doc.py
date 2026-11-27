@@ -5,11 +5,18 @@
 import json
 import sys
 
-TEXT = 'plaid is an efficient engine for late interaction retrieval.\n\n这一行是中文不应该触发。\n'
+TEXT = ('plaid is an efficient engine for late interaction retrieval.\n\n这一行是中文不应该触发。\n\n'
+        'Utility-Oriented state-of-the-art\n\ncache set\n')
 OUT = sys.argv[1]
 A = TEXT.index('late')                              # 短语的第一个字符
 B = TEXT.index('retrieval') + len('retrieval') - 1  # 短语的最后一个字符
 ZH = TEXT.index('中文')
+C = TEXT.index('Utility-Oriented')                    # 带连字符的复合词
+D = C + len('Utility-Oriented') - 1
+E = TEXT.index('state-of-the-art')                    # 词典里收了整条、有现成发音的复合词
+F = E + len('state-of-the-art') - 1
+G = TEXT.index('cache set')                           # 这两个词，词典给的发音是 WAV 而不是 MP3
+H = G + len('cache set') - 1
 
 
 def save(rect, origin, title_y):
@@ -17,12 +24,18 @@ def save(rect, origin, title_y):
     def mid(i):
         x, y, w, h = rect(i)
         return [x + w // 2, y + h // 2]
-    ax, ay, _, ah = rect(A)
-    bx, by, bw, bh = rect(B)
+
+    def span(i, j):
+        ax, ay, _, ah = rect(i)
+        bx, by, bw, bh = rect(j)
+        return [ax + 1, ay + ah // 2, bx + bw + 1, by + bh // 2]
     ox, oy = origin
+    # 空白处：最后一行文字的下面、靠左。弹窗总是出现在鼠标的右下方，靠左才不会点到它身上
+    _, ly, _, lh = rect(len(TEXT) - 2)
     with open(OUT, 'w') as f:
-        json.dump({'word': mid(2), 'zh': mid(ZH), 'drag': [ax + 1, ay + ah // 2, bx + bw + 1, by + bh // 2],
-                   'blank': [ox + 520, oy + 230], 'title': [ox + 200, title_y]}, f)
+        json.dump({'word': mid(2), 'zh': mid(ZH), 'drag': span(A, B), 'compound': span(C, D), 'entry': span(E, F),
+                   'wav': span(G, H),
+                   'blank': [ox + 24, ly + lh + 70], 'title': [ox + 200, title_y]}, f)
 
 
 if sys.platform.startswith('linux'):
@@ -35,7 +48,7 @@ if sys.platform.startswith('linux'):
     css.load_from_data(b'textview { font-size: 20pt; }')
     Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, 800)
     win = Gtk.Window(title='e2e-doc')
-    win.set_default_size(760, 320)
+    win.set_default_size(760, 520)
     win.move(60, 60)
     view = Gtk.TextView()
     view.set_wrap_mode(Gtk.WrapMode.WORD)
@@ -65,12 +78,12 @@ else:
     if sys.platform == 'win32':
         import ctypes
         try:
-            ctypes.WinDLL('shcore').SetProcessDpiAwareness(1)
+            ctypes.WinDLL('shcore').SetProcessDpiAwareness(2)   # 这样拿到的坐标才是真实的屏幕像素
         except Exception:
             pass
     root = tk.Tk()
     root.title('e2e-doc')
-    root.geometry('760x320+60+60')
+    root.geometry('760x520+60+60')
     text = tk.Text(root, font=('Helvetica' if sys.platform == 'darwin' else 'Segoe UI', 20), wrap='word', padx=12, pady=12)
     text.pack(fill='both', expand=True)
     text.insert('1.0', TEXT)

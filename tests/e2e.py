@@ -18,10 +18,12 @@ import time
 from urllib.request import Request, urlopen
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, '..', 'desktop'))
+import speak as app_code    # noqa: E402  （只借用里面的常量和画图标的函数，不会启动程序）
+
 OUT = os.path.abspath('e2e')
 SOFT = os.environ.get('E2E_SOFT') == '1'
 SENTINEL = 'E2E-SENTINEL'
-ICON = (27, 31)   # 喇叭图标中心相对"松开鼠标的位置"的偏移（弹窗左上角在 +12,+16）
 checks = []
 
 
@@ -33,10 +35,17 @@ class Win:
     def __init__(self):
         from ctypes import wintypes as w
         self.w, self.u = w, ctypes.WinDLL('user32')
-        try:
-            ctypes.WinDLL('shcore').SetProcessDpiAwareness(1)
-        except Exception:
-            pass
+        self.scale = 1.0
+        try:    # 声明"按真实像素工作"，并读出主屏幕的缩放比例
+            sh = ctypes.WinDLL('shcore')
+            sh.SetProcessDpiAwareness(2)
+            self.u.MonitorFromPoint.restype, self.u.MonitorFromPoint.argtypes = ctypes.c_void_p, [w.POINT, w.DWORD]
+            sh.GetDpiForMonitor.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+            dx, dy = w.UINT(), w.UINT()
+            if not sh.GetDpiForMonitor(self.u.MonitorFromPoint(w.POINT(0, 0), 1), 0, ctypes.byref(dx), ctypes.byref(dy)):
+                self.scale = dx.value / 96.0
+        except Exception as e:
+            print('could not read the screen scale: %r' % e, flush=True)
         u, P = self.u, ctypes.c_void_p
         self.ENUM = ctypes.WINFUNCTYPE(w.BOOL, P, w.LPARAM)
         for name, res, args in (
@@ -104,6 +113,31 @@ class Win:
     def release(self):
         pass
 
+    def record(self, path=None):
+        """录下这台机器放出来的声音（要有虚拟声卡：它把放出的声音原样送回录音端）。
+        不给 path = 开始录；给了 path = 停下，存成 wav。→ 成功与否"""
+        mm = ctypes.WinDLL('winmm')
+        mci = mm.mciSendStringW
+        if path is not None:
+            errs = [(c.split()[0], e) for c, e in ((c, mci(c, None, 0, None)) for c in
+                                                   ('stop e2erec', 'save e2erec "%s"' % path, 'close e2erec')) if e]
+            if errs:
+                print('recording could not be saved: %s' % errs, flush=True)
+            return not errs
+        tried = []
+        for rate, ch in ((16000, 1), (48000, 2), (44100, 2), (48000, 1), (44100, 1)):    # 录音设备不一定什么格式都收
+            mci('open new type waveaudio alias e2erec', None, 0, None)
+            fmt = mci('set e2erec time format ms bitspersample 16 channels %d samplespersec %d bytespersec %d alignment %d'
+                      % (ch, rate, rate * ch * 2, ch * 2), None, 0, None)
+            err = mci('record e2erec', None, 0, None)
+            if not err:
+                print('recording the sound output at %d Hz, %d channel(s)' % (rate, ch), flush=True)
+                return True
+            tried.append((rate, ch, fmt, err))
+            mci('close e2erec', None, 0, None)
+        print('recording not possible (%d recording devices): %s' % (mm.waveInGetNumDevs(), tried), flush=True)
+        return False
+
     def cursor(self):
         """当前鼠标光标的名字（程序靠它判断是不是在选字）。"""
         w = self.w
@@ -119,6 +153,7 @@ class Win:
 
 class Mac:
     lazy = True
+    scale = 1.0
 
     def __init__(self):
         self.cg = ctypes.CDLL('/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices')
@@ -204,6 +239,7 @@ class Mac:
 class X11:
     lazy = False
     audio = True
+    scale = 1.0
 
     def __init__(self):
         self.x, self.xt = ctypes.CDLL('libX11.so.6'), ctypes.CDLL('libXtst.so.6')
@@ -349,15 +385,57 @@ def shot(d, name):
         print('screenshot %s failed: %r' % (name, e), flush=True)
 
 
-def speak(d, log, x, y, name, chars):
-    """在 (x, y) 处松开鼠标后弹出了喇叭：点它，核对结果。"""
+def icon_at(log):
+    """喇叭图标的位置。程序每次显示弹窗，都会把弹窗的左上角和图标的边长记进日志。→ (中心 x, 中心 y, 左, 上, 边长)"""
+    found = re.findall(r' popup at (-?\d+),(-?\d+) icon (\d+)', log.new())
+    if not found:
+        return None
+    x, y, n = map(int, found[-1])
+    return x + n // 2, y + n // 2, x, y, n
+
+
+def look(d, log, name):
+    """刚出现的喇叭：大小对不对，画得清不清楚（把它从截图里裁出来，和预先算好的位图逐个像素比）。"""
+    at = icon_at(log)
+    want = int(round((app_code.ICON - 2) * d.scale)) + 2
+    check('喇叭的边长是 %d 像素（1.0.1 是 %d）' % (want, int(round(30 * d.scale)) + 2), at and at[4] == want,
+          at and 'popup %d,%d size %d, screen scale %.2f' % (at[2], at[3], at[4], d.scale))
+    try:
+        from PIL import Image
+        im = Image.open(os.path.join(OUT, name + '.png')).convert('RGB')
+    except Exception as e:
+        return print('icon not inspected: %r' % e, flush=True)
+    if not at or isinstance(d, Mac):    # macOS 的截图分辨率和坐标不一定是一比一，只留图不比对
+        return
+    _, _, x, y, n = at
+    box = im.crop((x - 6, y - 6, x + n + 6, y + n + 6))
+    box.resize((box.width * 8, box.height * 8), Image.NEAREST).save(os.path.join(OUT, name + '-icon-x8.png'))
+    got = list(im.crop((x + 1, y + 1, x + n - 1, y + n - 1)).getdata())
+    shades = len(set(got))
+    if not isinstance(d, Win):
+        return print('icon: %d different colours inside the %d px box' % (shades, n), flush=True)
+    ref = [tuple(int(c[i:i + 2], 16) for i in (1, 3, 5))
+           for c in app_code.speaker(n - 2, app_code.BLUE, '#ffffff').replace('{', ' ').replace('}', ' ').split()]
+    off = sum(1 for a, b in zip(got, ref) if max(abs(p - q) for p, q in zip(a, b)) > 2)
+    check('屏幕上的喇叭和抗锯齿位图逐像素一致', len(got) == len(ref) and off == 0,
+          '%d of %d pixels differ; %d shades between blue and white' % (off, len(ref), shades))
+
+
+def speak(d, log, name, chars, clips=None, mt=False):
+    """选中文字后弹出了喇叭：点它，核对结果。clips：应该由几段词典发音接起来读；mt：应该用到机翻。"""
+    at = icon_at(log)
+    if not check(name + '：日志里有喇叭的位置', at):
+        return
+    x, y = at[:2]
     if d.lazy:
         check(name + '：出现喇叭后，前台仍是文档', d.doc_front(), d.front())
     log.mark()
-    glide(d, x + ICON[0], y + ICON[1])
+    glide(d, x, y)
     time.sleep(0.4)
-    click(d, x + ICON[0], y + ICON[1])
-    played = log.wait(r' play (ok|fail.*)', 15)
+    click(d, x, y)
+    played = log.wait(r' play (ok|fail)(?: (\d+) clips (\d+) ms)?.*', 15)
+    done = played and played.group(1) == 'ok' and log.wait(r' played (\d+) clips in (\d+) ms', 12)
+    translated = mt and log.wait(r' mt (ok|none)(.*)', 12)
     time.sleep(1.2)
     shot(d, name)
     new = log.new()
@@ -368,8 +446,24 @@ def speak(d, log, x, y, name, chars):
         check(name + '：模拟"复制"之后没有留下按着的修饰键', not d.mods(), d.mods())
     got = [check(name + '：取到了释义', ' mean ok' in new, net=True),
            check(name + '：下载到了发音', ' voice ok' in new or played, net=True)]
-    # 没有声卡的机器上放不出声音，这一项只能跳过
+    if clips:
+        m = re.search(r' voice ok (\d+) clips( unsure)?( wav)?', new)
+        want = clips if isinstance(clips, tuple) else (clips,)
+        if name == '3d-wav':    # 这一项要测的就是 WAV 格式的发音放不放得出来
+            check(name + '：取到的发音里有 WAV 格式的', m and m.group(3), m and m.group(0), hard=False, net=True)
+        got.append(check(name + '：发音由 %s 段词典发音组成（不是整段语音合成）' % ' 或 '.join(map(str, want)),
+                         m and int(m.group(1)) in want and not m.group(2), m and m.group(0), net=True))
+    if mt:  # 机翻用的是公共的免费接口，按来源地址限额：测试机上不一定有额度，所以只报告，不算失败
+        check(name + '：机翻有结果', translated and translated.group(1) == 'ok', translated and translated.group(0),
+              hard=False)
+    # 没有声卡的机器上放不出声音，下面几项只能跳过
     check(name + '：播放了发音', played and played.group(1) == 'ok', played and played.group(0), hard=d.audio, net=True)
+    if played and played.group(2):
+        n, ms = int(played.group(2)), int(played.group(3))
+        took = done and int(done.group(2))
+        check(name + '：%d 段全部播完，用时和音频的长度对得上' % n,
+              done and int(done.group(1)) == n and ms * 0.8 <= took <= ms + 1500 + 400 * n,
+              '%s; audio is %d ms' % (done and done.group(0), ms), hard=d.audio and not isinstance(d, X11), net=True)
     if isinstance(d, Win):
         m = re.search(r' playing: mode=(\w+) position=(\d+)/(\d+)', new)
         check(name + '：播放进度在走', m and int(m.group(2)) > 0, m and m.group(0), hard=d.audio, net=True)
@@ -401,17 +495,45 @@ def run(d, log, pos, cmd, t0):
     check('双击选词后出现喇叭', m, d.cursor())
     if not d.lazy:
         check('识别出选中了 5 个字符', m and ' 5 chars' in m.group(0))
-    speak(d, log, wx, wy, '2-word', 5)
+    look(d, log, '1-speaker')
+    speak(d, log, '2-word', 5, clips=1)
 
     click(d, *pos['blank'])
     time.sleep(0.8)
     log.mark()
-    x0, y0, x1, y1 = pos['drag']
-    drag(d, x0, y0, x1, y1)
+    drag(d, *pos['drag'])
     m = log.wait(show, 6)
     time.sleep(0.5)
     check('拖选短语后出现喇叭', m)
-    speak(d, log, x1, y1, '3-phrase', 26)     # 第二次取词：上一次还原剪贴板之后还能不能再取到
+    # 第二次取词：上一次还原剪贴板之后还能不能再取到。三个词各有词典发音，应该接起来读
+    speak(d, log, '3-phrase', 26, clips=3, mt=True)
+
+    click(d, *pos['blank'])
+    time.sleep(0.8)
+    log.mark()
+    drag(d, *pos['compound'])
+    m = log.wait(show, 6)
+    time.sleep(0.5)
+    check('拖选带连字符的复合词后出现喇叭', m)
+    speak(d, log, '3b-compound', 16, clips=2, mt=True)     # Utility-Oriented：两个词分别用词典发音
+
+    click(d, *pos['blank'])
+    time.sleep(0.8)
+    log.mark()
+    drag(d, *pos['entry'])
+    m = log.wait(show, 6)
+    time.sleep(0.5)
+    check('拖选词典里收了整条的复合词后出现喇叭', m)
+    speak(d, log, '3c-entry', 16, clips=(1, 5))            # state-of-the-art：词典里有整条的发音，一段读完（它偶尔取不到，那就逐词读）
+
+    click(d, *pos['blank'])
+    time.sleep(0.8)
+    log.mark()
+    drag(d, *pos['wav'])
+    m = log.wait(show, 6)
+    time.sleep(0.5)
+    check('拖选 cache set 后出现喇叭', m)
+    speak(d, log, '3d-wav', 9, clips=2, mt=True)           # cache、set：词典给的这两段发音是 WAV，不是 MP3
 
     click(d, *pos['blank'])
     time.sleep(0.8)
@@ -426,14 +548,15 @@ def run(d, log, pos, cmd, t0):
         click(d, *pos['blank'])
         time.sleep(0.8)
         log.mark()
-        zx, zy = pos['zh']
-        click(d, zx, zy, 2)
+        click(d, *pos['zh'], 2)
         m = log.wait(show, 6)
         time.sleep(0.5)
+        at = icon_at(log)
         log.mark()
-        glide(d, zx + ICON[0], zy + ICON[1])
-        time.sleep(0.4)
-        click(d, zx + ICON[0], zy + ICON[1])
+        if at:
+            glide(d, *at[:2])
+            time.sleep(0.4)
+            click(d, *at[:2])
         got = log.wait(r' grab \d+ chars -> ([a-z ]+)', 6)
         time.sleep(0.8)
         shot(d, '4-chinese')
@@ -471,7 +594,7 @@ def run(d, log, pos, cmd, t0):
         d.u.PostMessageW(d.u.FindWindowW('earImmersionHidden', None), 0x8001, 0, 0x0205)
         time.sleep(1.2)
         shot(d, '6-tray-menu')
-        click(d, bx + 40, by + 14)                  # 第一项"使用说明"
+        click(d, bx + int(40 * d.scale), by + int(14 * d.scale))    # 第一项"使用说明"
         check('托盘菜单能用（选"使用说明"后再次显示提示）', log.wait(r' hello', 6))
         time.sleep(0.5)
 
@@ -508,7 +631,7 @@ def run(d, log, pos, cmd, t0):
         # 其他系统上的对话框不好自动点，直接走"再运行一次 → 退出"背后的那条本机连接
         log.mark()
         try:
-            with socket.create_connection(('127.0.0.1', 47631), timeout=3) as s:
+            with socket.create_connection(('127.0.0.1', app_code.PORT), timeout=3) as s:
                 s.sendall(b'quit')
                 answer = s.recv(32)
         except OSError as e:
@@ -516,10 +639,22 @@ def run(d, log, pos, cmd, t0):
         check('收到退出请求后程序退出', answer.startswith(b'earImmersion') and log.wait(r' quit', 10), answer)
 
 
+def heard(path):
+    """录音里有多少秒是有声音的（按 0.1 秒一格，峰值超过满刻度的 1% 算有声音）。"""
+    import array
+    import wave
+    with wave.open(path) as f:
+        rate, a = f.getframerate() * f.getnchannels(), array.array('h', f.readframes(f.getnframes()))
+    step = rate // 10
+    return sum(1 for i in range(0, len(a) - step, step) if max(a[i:i + step], key=abs) not in range(-327, 328)) / 10.0
+
+
 def attempt(d, cmd):
     """完整地跑一遍：开文档窗口、启动程序、逐项检查、收尾。"""
     del checks[:]
     d.at, d.offline = (5, 5), False
+    tape = os.path.join(OUT, 'loopback.wav')
+    taping = isinstance(d, Win) and d.audio and d.record()
     log = Log(os.path.join(d.data_dir(), 'log.txt'))
     try:
         os.remove(log.path)
@@ -549,6 +684,15 @@ def attempt(d, cmd):
         import traceback
         check('测试脚本自身出错', False, traceback.format_exc())
     finally:
+        if taping:
+            try:
+                secs = d.record(tape) and heard(tape)
+                spoken = sum(int(ms) for ms in re.findall(r' play ok \d+ clips (\d+) ms', log.read())) / 1000.0
+                check('从虚拟声卡上录到了程序放出的声音', spoken and secs and secs >= spoken * 0.6,
+                      'sound in %.1f s of the recording; the clips played add up to %.1f s' % (secs or 0, spoken),
+                      net=True)
+            except Exception as e:
+                check('从虚拟声卡上录到了程序放出的声音', False, repr(e), hard=False)
         print('\n──── app log ────\n' + log.read(), flush=True)
         time.sleep(1)
         if app and app.poll() is not None:
@@ -576,7 +720,7 @@ def main():
     cmd = sys.argv[1:]
     os.makedirs(OUT, exist_ok=True)
     d = Win() if sys.platform == 'win32' else Mac() if sys.platform == 'darwin' else X11()
-    print('this machine can play sound:', d.audio, flush=True)
+    print('this machine can play sound: %s; screen scale: %.2f' % (d.audio, d.scale), flush=True)
     failed = attempt(d, cmd)
     if failed and d.offline and all(c['net'] for c in failed):
         print('\nOnly the lookups failed, and the test itself could not reach the dictionary service either:\n'

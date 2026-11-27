@@ -4,28 +4,37 @@
 在任意软件里选中英文 → 鼠标旁出现小喇叭 → 点击听标准发音并显示中文释义。
 单文件、无第三方依赖，支持 Windows / macOS / Linux(X11)。用法见 README.md。
 """
+import array
 import collections
 import ctypes
 import hashlib
+import html
 import json
 import os
 import queue
 import re
 import shutil
+import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
 import traceback
+from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-VERSION = '1.0.1'
+VERSION = '1.0.2'
 ACCENT = 2          # 2 = 美音，1 = 英音
-MAX_LEN = 300       # 选中内容超过这个长度就不出现喇叭
+MAX_LEN = 300       # 选中内容超过这个长度就不读
 ANY_CURSOR = False  # 仅 Windows：鼠标是普通箭头时（拖窗口、点图标）也出现喇叭
-PORT = 47631        # 本机端口：防止重复启动；再次运行时靠它找到已经在运行的那个
+ICON = 22           # 喇叭的边长（按 100% 缩放算的像素；高分屏自动放大）
+MT = True           # 词典里没有的词组 / 生词 / 整句，交给机器翻译
+MT_EMAIL = ''       # 可选：填了邮箱，机翻的免费额度从每天 5000 个字符提高到 50000 个（邮箱会发给翻译服务）
+# 本机端口：防止重复启动；再次运行时靠它找到已经在运行的那个。自动测试会换一个端口，免得把正在用的那个实例关掉
+PORT = int(os.environ.get('EARIMMERSION_PORT') or 47631)
 
 WIN, MAC = sys.platform == 'win32', sys.platform == 'darwin'
 # 数据目录：日志 log.txt、可选的设置 config.json、发音缓存 voice/
@@ -35,7 +44,9 @@ DATA = (os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'), 
 VOICE, LOG = os.path.join(DATA, 'voice'), os.path.join(DATA, 'log.txt')
 
 YD = 'https://dict.youdao.com/'
-DICTS = '{"count":99,"dicts":[["ec","fanyi","web_trans","aiDefinition"]]}'
+DICTS = '{"count":99,"dicts":[["ec","web_trans"]]}'
+MYMEMORY = 'https://api.mymemory.translated.net/get?'
+BAIDU = 'https://fanyi.baidu.com/gettts?lan=%s&spd=3&source=web&text=%s'
 BLUE, INK, EDGE = '#1a73e8', '#1f2328', '#c9d1d9'
 _log_lock = threading.Lock()
 
@@ -50,15 +61,19 @@ def log(msg):
 
 
 def load_config():
-    """读取 config.json（可选），例如 {"accent": 1, "max_len": 300, "any_cursor": true}。"""
-    global ACCENT, MAX_LEN, ANY_CURSOR
+    """读取 config.json（可选），例如 {"accent": 1, "icon_size": 26}。"""
+    global ACCENT, MAX_LEN, ANY_CURSOR, ICON, MT, MT_EMAIL
     try:
         with open(os.path.join(DATA, 'config.json'), encoding='utf-8') as f:
             c = json.load(f)
         ACCENT = 1 if c.get('accent', ACCENT) == 1 else 2
         MAX_LEN = int(c.get('max_len', MAX_LEN))
         ANY_CURSOR = bool(c.get('any_cursor', ANY_CURSOR))
-        log('config accent=%d max_len=%d any_cursor=%s' % (ACCENT, MAX_LEN, ANY_CURSOR))
+        ICON = min(64, max(14, int(c.get('icon_size', ICON))))
+        MT = bool(c.get('mt', MT))
+        MT_EMAIL = str(c.get('mt_email') or '').strip()
+        log('config accent=%d max_len=%d any_cursor=%s icon_size=%d mt=%s%s'
+            % (ACCENT, MAX_LEN, ANY_CURSOR, ICON, MT, ' +email' if MT_EMAIL else ''))
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -66,6 +81,10 @@ def load_config():
 
 
 # ───────────────────────── 取词清洗 / 网络 ─────────────────────────
+
+SEP = r'[\s\-‐‑‒–—/_]+'    # 词与词之间：空白、各种连字符、斜杠、下划线
+STOP = set('a an the of to in on at for with by and or as is are be'.split())   # 逐词给释义时略过的虚词
+
 
 def clean(s):
     """整理选中的文本；不是以英文为主的内容返回空串。"""
@@ -77,102 +96,539 @@ def clean(s):
     return s if letters and letters * 2 >= len(s.replace(' ', '')) else ''
 
 
+def width(s):
+    """显示宽度：汉字算 2 列。"""
+    return sum(2 if ord(ch) > 0x2e7f else 1 for ch in s)
+
+
 def wrap(s, cols=52):
-    """按显示宽度折行（汉字算 2 列）。自己折行，是因为两套界面库的自动换行对中文都不理想。"""
+    """按显示宽度折行。自己折行，是因为两套界面库的自动换行对中文都不理想。"""
     out = []
     for line in s.split('\n'):
-        cur, n = '', 0
+        cur = ''
         for ch in line:
-            w = 2 if ord(ch) > 0x2e7f else 1
-            if n + w > cols:
-                out.append(cur)
-                cur, n = '', 0
+            if width(cur + ch) > cols:
+                cut = cur.rfind(' ') if ch.isascii() and ch != ' ' else -1
+                if cut > len(cur) // 2:     # 英文单词不从中间断开：退到上一个空格处换行
+                    out.append(cur[:cut])
+                    cur = cur[cut + 1:]
+                else:
+                    out.append(cur)
+                    cur = ''
+                    if ch == ' ':
+                        continue
             cur += ch
-            n += w
         out.append(cur)
     return '\n'.join(out)
 
 
-def http(url, data=None):
+def strip(w):
+    """去掉一个词两头的标点；e.g. / U.S. 这类自带句点的缩写保持原样。"""
+    w = w.strip(' \t"\'“”‘’()[]{}<>,;:!?*')
+    return w if '.' in w.rstrip('.') and not w[:1].isdigit() else w.rstrip('.')
+
+
+# 常见的前缀。词典里它们另有一条（"re-"），意思和读音都和碰巧同形的单词不一样：单独的 re 是"铼"，co 是"公司"，inter 是"埋葬"
+PREFIX = set('re co bi de di un pre non sub semi multi anti self cross inter intra hyper super ultra micro macro nano mono '
+             'poly pseudo quasi omni mid post auto tri uni'.split())
+
+
+def pieces(q, affix=False):
+    """把选中的内容拆成一个个词：Utility-Oriented → Utility、Oriented。
+    affix=True：后面紧跟着连字符的前缀带上那个连字符（re-ranking → re-、ranking），好去查词典里前缀的那一条。"""
+    xs = re.split('(%s)' % SEP, q)                          # 词、分隔符、词、分隔符……
+    ws = [(strip(xs[i]), xs[i + 1][:1] if i + 1 < len(xs) else '') for i in range(0, len(xs), 2)]
+    ws = [(w, sep) for w, sep in ws if w]
+    return [w + '-' if affix and sep in ('-', '‐', '‑') and w.lower() in PREFIX and i + 1 < len(ws) else w
+            for i, (w, sep) in enumerate(ws)]
+
+
+def base(w):
+    """全大写缩写的复数：LLMs → LLM；别的原样返回。"""
+    m = re.fullmatch("([A-Z]{2,})[’']?s", w)
+    return m.group(1) if m else w
+
+
+def http(url, data=None, timeout=6):
     req = Request(url, urlencode(data).encode() if data else None, {'User-Agent': 'Mozilla/5.0'})
-    with urlopen(req, timeout=6) as r:
-        return r.read()
+    for again in (True, False):
+        try:
+            with urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except HTTPError:           # 服务器明确答复了"没有"：不用再试
+            raise
+        except OSError:             # 连接中途断了之类的偶发问题：稍等再试一次
+            if not again:
+                raise
+            time.sleep(0.3)
 
 
 def _norm(s):
     return re.sub('[^a-z0-9]+', '', s.lower())
 
 
-def lookup_one(q):
-    d = json.loads(http(YD + 'jsonapi_s?doctype=json&jsonversion=4',
-                        {'q': q, 'le': 'en', 'client': 'web', 'keyfrom': 'webdict', 'dicts': DICTS}))
-    if _norm(d.get('input') or '') != _norm(q):  # 查不到时接口会返回一个无关词条
+def _list(x):
+    return x if isinstance(x, list) else [x] if x else []
+
+
+_memo, _memo_lock = {}, threading.Lock()
+
+
+def once(key, fn):
+    """同一个 key 只算一次，结果记在内存里；别的线程正在算就等它。出错不记，下次重算。"""
+    with _memo_lock:
+        if len(_memo) > 4000:
+            _memo.clear()
+        slot = _memo.setdefault(key, [threading.Lock()])
+    with slot[0]:
+        if len(slot) == 1:
+            slot.append(fn())
+        return slot[1]
+
+
+def together(fn, items):
+    """对每一项调用 fn（同时进行），按原来的顺序返回结果。个别出错的记为 None；全都出错就把错误抛出去。"""
+    out = [None] * len(items)
+
+    def run(i):
+        try:
+            out[i] = fn(items[i])
+        except Exception as e:
+            out[i] = e
+    ts = [threading.Thread(target=run, args=(i,)) for i in range(1, len(items))]
+    [t.start() for t in ts]
+    if items:
+        run(0)
+    [t.join() for t in ts]
+    if items and all(isinstance(r, Exception) for r in out):
+        raise out[0]
+    return [None if isinstance(r, Exception) else r for r in out]
+
+
+# ───────────────────────── 释义：词典 + 机翻 ─────────────────────────
+
+# 义项前面的学科标注：（计算机）、（博弈论，经济学）、（数）……
+FIELD = re.compile('（[^（）]*(?:计算机|人工智能|机器学习|自然语言|数学|统计|逻辑|物理|化学|化工|生物|遗传|医学|心理学|语言学|经济|金融|博弈'
+                   '|电学|电子|通信|工程|天文|光学|力学|图形|图像|数据|算法)[^（）]*）|（[数计医生化物电]）')
+
+
+def brief(s, cols=60):
+    """词典里的一行释义可能很长：只留前面几个义项。排在后面、带学科标注的义项（"（计算机）转换器"）只要还放得下
+    也留着：读文献时要找的往往是它们。"""
+    s, out = ' '.join(re.sub('<[^>]+>', '', s).split()), ''
+    parts = re.findall('[^；;]+[；;]?', s)
+    while parts and not (out and width(out + parts[0]) > cols):
+        out += parts.pop(0)
+    out = out.rstrip('；; ')
+    for part in parts:
+        part = part.strip('；; ')
+        m = FIELD.match(part)
+        for p in (part, re.sub('（[^（）]{6,}）$', '', part)) if m else ():   # 太长的话，去掉末尾括号里的说明再试一次
+            if p != m.group() and width(out + '；' + p) <= cols * 1.5:
+                out += '；' + p
+                break
+    if width(out) > cols * 1.5:             # 一个义项就这么长（百科式的解释）：留冒号前面的词，没有冒号就截断
+        head = out.split('：')[0]
+        if 3 < len(head) < len(out):
+            return head
+        while width(out) > cols:
+            out = out[:-1]
+        cut = out.rfind('（')
+        if cut > 5 and '）' not in out[cut:]:                # 别截在括号中间
+            return out[:cut]
+        out += '…'
+    return out
+
+
+def entry(w):
+    """有道词典里 w 这一条 → {'phone': 音标, 'lines': [释义…], 'say': 发音的键}；没有收录返回 None。"""
+    return once(('entry', w), lambda: _entry(w))
+
+
+def _entry(w):
+    d = json.loads(http(YD + 'jsonapi?' + urlencode({'q': w, 'le': 'en', 'dicts': DICTS})))
+    try:
+        if _norm(d.get('input') or '') != _norm(w):         # 答非所问的不要
+            return None
+        word = (_list((d.get('ec') or {}).get('word')) or [{}])[0]
+        head = ((word.get('return-phrase') or {}).get('l') or {}).get('i') or w
+        if len(pieces(w)) > 1 and head.isupper() and not re.search(SEP, head) and head != ''.join(pieces(w)):
+            return None                                     # ViT-S 查到的是另一个东西：缩写 VITS
+        lines = [i for t in _list(word.get('trs')) for tr in _list(t.get('tr'))
+                 for i in _list((tr.get('l') or {}).get('i')) if isinstance(i, str) and i.strip()]
+        lines = [x for x in lines if x[:1] != '《'] or lines         # 同名的书刊条目排在后面，有别的释义就不要它
+        if lines and _norm(head) != _norm(w):                       # 词典把它指到了原形上（logits → logit）：标出来
+            lines[0] = '（%s）%s' % (head, lines[0])
+        web = not lines
+        if web:                 # 词典正文里没有：看"网络释义"里有没有一模一样的词条。那是从网页上收集来的，不一定可靠，所以标出来
+            word = {}
+            for x in _list((d.get('web_trans') or {}).get('web-translation')):
+                if x.get('@same') == 'true' and _norm(x.get('key') or '') == _norm(w):
+                    vals = [t.get('value') for t in _list(x.get('trans')) if isinstance(t.get('value'), str)]
+                    lines = ['（网络释义）' + '；'.join(list(dict.fromkeys(vals))[:3])] if vals else []
+                    break
+        if not lines:
+            return None
+        us, uk = ('us', 'uk') if ACCENT == 2 else ('uk', 'us')
+        return {'phone': word.get(us + 'phone') or word.get(uk + 'phone') or word.get('phone') or '',
+                'lines': [brief(x) for x in lines[:3]], 'web': web, 'head': head,
+                'say': word.get(us + 'speech') or word.get(uk + 'speech') or word.get('speech') or ''}
+    except (AttributeError, TypeError, IndexError):         # 应答的结构和预想的不一样：当作没查到
         return None
-    ec = d.get('ec') or {}
-    w = ec.get('word') or {}
-    if isinstance(w, list):
-        w = w[0] if w else {}
-    lines = [((t.get('pos') or '') + ' ' + t['tran']).strip() for t in w.get('trs') or [] if t.get('tran')]
-    if not lines and ec.get('web_trans'):
-        lines = ['；'.join(ec['web_trans'][:3])]
-    if not lines and (d.get('fanyi') or {}).get('tran'):
-        lines = [d['fanyi']['tran']]
-    if not lines:
-        words = (d.get('aiDefinition') or {}).get('words') or [{}]
-        s = re.split('[。\n]', re.sub('<[^>]+>', '', words[0].get('content') or ''))[0]
-        lines = [s] if s else []
-    return {'phone': w.get('usphone') or w.get('ukphone') or '', 'lines': lines[:3]} if lines else None
+
+
+def affix(w):
+    """"re-" 这样的前缀在词典里的那一条；词典里没有就返回 None。"""
+    e = entry(w.lower())
+    return e if e and e['head'].endswith('-') else None
+
+
+def gloss(w):
+    """查一个词；全大写缩写的复数（LLMs）查不到时改查单数。→ (实际查到的词, 词条或 None)"""
+    if w.endswith('-'):
+        e = affix(w)
+        if e:
+            return w, e
+        w = w[:-1]
+    e = entry(w)
+    if not e and base(w) != w:
+        return base(w), entry(base(w))
+    return w, e
 
 
 def lookup(q):
-    """返回 {'phone': 音标, 'lines': [释义…]}，查不到返回 None。"""
+    """查释义 → {'phone': 音标, 'lines': [释义…], 'mt': 还要拿去机翻的原文（不需要就是空串）}。"""
+    ws = pieces(q)
+    if len(ws) > 6:                                         # 一句话：只能机翻
+        return {'phone': '', 'lines': [], 'mt': q if MT else ''}
+    web = []
+    for cand in dict.fromkeys([strip(q), ' '.join(ws)]):    # 整个就是词典里的一条？（单词、fine-tuning、machine learning）
+        e = entry(cand) if cand else None
+        if e and e['web'] and len(ws) > 1:                  # 词组只在"网络释义"里有（top-k 给的是"百度面试题"）：
+            web = web or e['lines'][:1]                     # 留着这一行，下面照样逐词解释、整体机翻
+        elif e:
+            return {'phone': e['phone'], 'lines': e['lines'], 'mt': ''}
+    if len(ws) < 2:
+        w, e = gloss(ws[0]) if ws else ('', None)
+        if e:                                               # LLMs：给出 LLM 的释义
+            return {'phone': e['phone'], 'lines': ['%s 的复数' % w] + e['lines'][:2], 'mt': ''}
+        return {'phone': '', 'lines': [], 'mt': ' '.join(ws) if MT else ''}     # 生词：只能机翻
+    # 词典里没有的复合词 / 词组：逐词给释义，整体交给机翻
+    uniq = [w for w in dict.fromkeys(pieces(q, True)) if w.lower() not in STOP and not w[0].isdigit()]
+    got = [g for g in together(gloss, uniq) if g and g[1]] if uniq else []
+    phones = [e['phone'].split(';')[0].strip() for _, e in got]
+    cols = 60 if len(got) <= 3 else 40      # 词少的时候多留几个义项：专业上的意思（retrieval 的"检索"）常常排在后面
+    return {'phone': ' '.join(phones) if len(got) == len(ws) <= 4 and all(phones) else '',
+            'lines': web + ['%s：%s' % (w, brief(e['lines'][0], cols)) for w, e in got],
+            'mt': ' '.join(ws) if MT else ''}
+
+
+def translate(text):
+    """机器翻译（MyMemory 的免费接口，匿名每天 5000 个字符）→ (译文, 说明)；没翻出来时译文是空串。"""
+    args = {'q': text, 'langpair': 'en|zh-CN'}
+    if MT_EMAIL:
+        args['de'] = MT_EMAIL
+    d = json.loads(http(MYMEMORY + urlencode(args), timeout=8))
+    t = html.unescape(str((d.get('responseData') or {}).get('translatedText') or '')).strip()
+    if str(d.get('responseStatus')) == '429' or d.get('quotaFinished') or 'MYMEMORY WARNING' in t.upper():
+        return '', '今天的免费机翻额度用完了'
+    if str(d.get('responseStatus')) != '200' or not re.search('[一-鿿]', t) or _norm(t) == _norm(text):
+        return '', ''                                       # 原样退回来的（专有名词）不算翻译
+    return t, ''
+
+
+# ───────────────────────── 发音：词典里的真人发音，一段段接起来；实在没有才用语音合成 ─────────────────────────
+
+def spelled(w):
+    """全大写的一串字母是不是一个个字母念的（LLM、GPT、OS），而不是当成一个词念（PLAID、NASA）。"""
+    if not re.fullmatch('[A-Z]{2,6}', w):
+        return False
+    e = entry(w)
+    if e and e['phone']:
+        return ' ' in e['phone'].strip()                    # 音标里有空格 = 分开念的
+    return bool(e and e['say']) or stiff(w)
+
+
+def stiff(w):
+    """全大写的 w 没法当成一个单词读：三个字母以内，没有元音，或者辅音三个连在一起（RMSE）。"""
+    return len(w) <= 3 or not re.search('[AEIOUY]', w) or bool(re.search('[^AEIOUY]{3}', w))
+
+
+def humps(w):
+    """按大小写和数字把一个词拆开：ChatGPT → Chat、GPT；ColBERTv2 → Col、BERT、v、2。拆不开返回 []。"""
+    sub = re.findall(r'[A-Z]{2,}(?![a-z]{2})|[A-Z]?[a-z]+|[A-Z]|\d+', w)
+    if len(sub) > 1 and sub[-1] == 's' and len(sub[-2]) > 1 and sub[-2].isupper():
+        sub.pop()                                           # cFIMs：最后那个 s 是复数
+    return sub if len(sub) > 1 and ''.join(sub) in (w, w[:-1]) else []
+
+
+def steps_for(w, strict=False):
+    """一个词怎么读 → ([(词典的发音键, 文本), …], 读音有没有把握)。发音键为空 = 交给语音合成去读文本。strict 见 plan。"""
+    if w.endswith('-'):                                     # 前缀：词典里另有一条，有它自己的发音就用
+        e = affix(w)
+        if e and e['say'] and e['phone']:
+            return [(e['say'], w)], True
+        w = w[:-1]
+    e = entry(w)
+    if not (e and e['say']) and base(w) != w:               # LLMs：词典里只有 LLM
+        w = base(w)
+        e = entry(w)
+    sub = humps(w)
+    if spelled(w) and (strict and stiff(w) or not (e and e['say'])):
+        return [('%s&type=%d' % (c, ACCENT), c) for c in w], True      # 按字母读：26 个字母的发音是词典自己的
+    if e and e['say']:
+        # 有音标的是词典自己的发音。没有音标的那些是词典用语音合成读的，里面夹着缩写时会读错
+        # （ChatGPT 只读出 chat，macOS 读成一个词）：这种拆开，缩写单独按字母读
+        if e['phone'] or not any(together(spelled, sub) if sub else ()):
+            return [(e['say'], w)], True
+    if re.fullmatch(r'\d[\d.,]*', w):                       # 数字：词典的发音接口读得对（语音合成会把单个数字读错）
+        return [('%s&type=%d' % (w.replace(',', ''), ACCENT), w)], True
+    if sub:                                                 # 驼峰、字母数字混排（PixelMatte、GPT4）：拆开，各读各的
+        rs = together(lambda x: steps_for(x, strict), sub)
+        return [x for r in rs for x in (r[0] if r else [])], bool(e) and all(r and r[1] for r in rs)
+    return [('', w.lower() if w.isupper() else w)], False   # 生词：语音合成按拼写去读
+
+
+def plan(q, strict=False):
+    """把 q 读出来的步骤 → ([(词典的发音键, 文本), …], 读音有没有把握)。
+
+    词典里有两种发音不一定靠得住，取下来之后要核对（见 limits 和 voice）：整条词组的发音（fine-tuning、state of the art），
+    和按字母念的缩写的发音（GPT、AUC：多半是词典用语音合成读的，有的没把字母念全）。
+    strict=True 就是这两种都不用：词组逐词读，缩写一个字母一个字母地读。
+    """
+    ws = pieces(q)
+    for cand in dict.fromkeys([strip(q), ' '.join(ws)]) if 1 < len(ws) <= 6 and not strict else ():
+        e = entry(cand) if cand else None                   # 词典把它指到别的词形上的不算（language-modeling → language model）
+        if e and e['say'] and _norm(e['head']) == _norm(cand):
+            return [(e['say'], cand)], True
+    ws = pieces(q, True)
+    if 0 < len(ws) <= 3:                                    # 短的：每个词都用词典里的发音，依次播放
+        rs = together(lambda w: steps_for(w, strict), ws)
+        return ([x for w, r in zip(ws, rs) for x in (r[0] if r else [('', w.rstrip('-'))])], all(r and r[1] for r in rs))
+    # 长的：整句交给语音合成（连字符换成空格，否则会读错）。按字母念的缩写它读不准，单独用词典里的发音
+    toks = ' '.join(x for x in re.split(SEP, q) if x).split() or [q]
+    caps = list(dict.fromkeys(w for w in (base(strip(t)) for t in toks) if re.fullmatch('[A-Z]{2,6}', w)))
+    shout = len([t for t in toks if strip(t).isupper()])
+    if shout >= 3 and shout * 3 > len(toks) * 2:            # 通篇大写（标题）：不是缩写，转成小写再读
+        return [('', ' '.join(toks).lower())], True
     try:
-        r = lookup_one(q)
+        apart = {w for w, yes in zip(caps, together(spelled, caps)) if yes} if caps else set()
+        found = dict(zip(sorted(apart), together(lambda w: steps_for(w, strict), sorted(apart)))) if apart else {}
     except Exception:
-        r = None
-    if r:
-        return r
-    # 整体查不到：几个不相关的词一起选中时，逐词给释义
-    ws = list(dict.fromkeys(w for w in (re.sub('^[^A-Za-z]+|[^A-Za-z]+$', '', x) for x in q.split()) if w))
-    if not 2 <= len(ws) <= 6:
-        return None
-    rs = [None] * len(ws)
-
-    def one(i):
-        try:
-            rs[i] = lookup_one(ws[i])
-        except Exception:
-            pass
-    ts = [threading.Thread(target=one, args=(i,)) for i in range(len(ws))]
-    [t.start() for t in ts]
-    [t.join() for t in ts]
-    lines = ['%s：%s' % (w, r['lines'][0]) for w, r in zip(ws, rs) if r]
-    return {'phone': '', 'lines': lines} if lines else None
+        found = {}
+    steps, cur = [], []
+    for t in toks:
+        r = found.get(base(strip(t)))
+        if r and r[1] and all(key for key, _ in r[0]):
+            if cur:
+                steps.append(('', ' '.join(cur)))
+                cur = []
+            steps += r[0]
+        else:
+            cur.append(t)
+    if cur:
+        steps.append(('', ' '.join(cur)))
+    return (steps if len(steps) <= 14 else [('', ' '.join(toks))]), True
 
 
-def voice_path(q):
-    return os.path.join(VOICE, hashlib.md5(('%d:%s' % (ACCENT, q)).encode()).hexdigest() + '.mp3')
+def limits(key, text):
+    """词典的这一段发音至少、至多该有多长（秒）。超出了，说明它靠不住（见 plan）。"""
+    if key and len(pieces(text)) > 1:                       # 整条的词组：偶尔是一串字母，长得离谱（data-driven 将近 5 秒）
+        return 0, 0.6 + 0.13 * len(text)
+    if len(key.split('&')[0]) > 1 and spelled(text) and stiff(text):
+        return 0.25 * sum(3 if c == 'W' else 1 for c in text), 99      # 缩写：太短 = 没把字母一个个念出来（AUC 只有 0.3 秒）
+    return 0, 99
 
 
-def voice(q):
-    """下载发音到缓存并返回文件路径；失败返回 None。先有道真人发音（区分大小写），再百度合成。"""
-    path = voice_path(q)
-    if os.path.exists(path):
-        return path
-    urls = ['%sdictvoice?audio=%s&type=%d' % (YD, quote(t), ACCENT) for t in dict.fromkeys([q.lower(), q])]
-    urls.append('https://fanyi.baidu.com/gettts?lan=%s&spd=3&source=web&text=%s'
-                % ('uk' if ACCENT == 1 else 'en', quote(q)))
+def clip(key, text):
+    """取一段发音存进缓存 → 文件路径；取不到返回 None。有发音键就取词典里的那一段，没有就让语音合成读 text。"""
+    stem = os.path.join(VOICE, hashlib.md5(('%d|%s|%s' % (ACCENT, key, '' if key else text)).encode()).hexdigest())
+    for ext in ('.mp3', '.wav'):
+        if os.path.exists(stem + ext):
+            return stem + ext
+    if key:
+        urls = [YD + 'dictvoice?audio=' + quote(key, safe='&=+%') + ('' if '&type=' in key else '&type=%d' % ACCENT)]
+    else:
+        urls = [BAIDU % ('uk' if ACCENT == 1 else 'en', quote(text)),
+                '%sdictvoice?audio=%s&type=%d' % (YD, quote(text.lower()), ACCENT)]
+    down = None
     for u in urls:
         try:
             b = http(u)
-        except Exception:
+        except HTTPError:                                   # 服务器说没有这一段
+            down = False
             continue
-        if len(b) > 500 and b[:1] != b'{':
-            with open(path + '.tmp', 'wb') as f:
-                f.write(b)
-            os.replace(path + '.tmp', path)
+        except Exception as e:
+            down = e if down is None else down
+            continue
+        if len(b) > 500 and b[:1] not in (b'{', b'<'):
+            path = stem + ('.wav' if b[:4] == b'RIFF' else '.mp3')      # 词典的发音绝大多数是 MP3，个别是 WAV（set、cache、字母 G）
+            tmp = '%s.%d.tmp' % (path, threading.get_ident())
+            with open(tmp, 'wb') as f:
+                f.write(trim(b))
+            os.replace(tmp, path)
             return path
+        down = False
+    if down:                                                # 哪个地址都没连上：是网络的问题，不是"没有这一段"
+        raise down
     return None
+
+
+def voice(q):
+    """q 的发音 → {'files': [要依次播放的文件名…], 'sure': 读音有没有把握}；一段都取不到返回 None。
+
+    读法会记在缓存目录里：听过的内容再点一次，不用联网。
+    """
+    memo = os.path.join(VOICE, hashlib.md5(('%s|%d|%s' % (VERSION, ACCENT, q)).encode()).hexdigest() + '.json')
+    try:
+        with open(memo, encoding='utf-8') as f:
+            v = json.load(f)
+        if v['files'] and all(os.path.exists(os.path.join(VOICE, x)) for x in v['files']):
+            return v
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+
+    lost = []                                               # 因为网络问题没取到的
+
+    def get(step):
+        try:
+            return clip(*step)
+        except Exception as e:
+            lost.append(e)
+
+    def fetch(steps):
+        uniq = list(dict.fromkeys(steps))
+        return dict(zip(uniq, together(get, uniq)))
+    steps, sure = plan(q)
+    have = fetch(steps)
+    if any(key and not (have[key, text] and lo <= seconds(have[key, text]) <= hi)
+           for key, text in have for lo, hi in [limits(key, text)]):
+        steps, sure = plan(q, True)                         # 词典的发音有的没取到，有的长短不对：换成稳妥的读法
+        have.update(fetch([x for x in steps if x not in have]))
+    for key, text in dict.fromkeys(steps):                  # 还是没取到的：退而用语音合成，但读音就没把握了
+        if key and not have[key, text]:
+            have[key, text], sure = get(('', text)), False
+            lost.append(None)                               # 词典的发音时有时无：这次凑合出来的读法不记，下次再试
+    got = [have[x] for x in steps]
+    v = {'files': [os.path.basename(x) for x in got if x], 'sure': bool(sure and all(got))}
+    if not v['files']:
+        if any(lost):
+            raise next(e for e in lost if e)
+        return None
+    if not lost:
+        with open(memo, 'w', encoding='utf-8') as f:
+            json.dump(v, f)
+    return v
+
+
+_BITRATE = {1: (0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320),      # MPEG-1 Layer III
+            2: (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160)}          # MPEG-2 / 2.5
+_RATE = {3: (44100, 48000, 32000), 2: (22050, 24000, 16000), 0: (11025, 12000, 8000)}
+# 32 张霍夫曼码表各自能表示的最大量化值（16 号以后的带"附加位"）
+_TOP = (0, 1, 2, 2, 0, 3, 3, 5, 5, 5, 7, 7, 7, 15, 0, 15) + tuple(
+    14 + (1 << x) for x in (1, 2, 3, 4, 6, 8, 10, 13, 4, 5, 6, 7, 8, 9, 11, 13))
+
+
+def frames(b):
+    """把 MP3 拆成帧，不解码，只读每帧开头的"边信息"。
+    → [(起始位置, 长度, 响度上界, 主数据往前借了多少字节, 这一帧自己能装多少字节主数据, 时长秒)]
+
+    响度上界：这一帧解码出来的能量不可能超过多少（1.0 = 满刻度）。量化步长是 2^((global_gain-210)/4)，
+    大值区有 2×big_values 条谱线、每条不超过码表的最大值，其余谱线只能是 ±1 而且每 4 条至少占 1 比特。
+    文件头里那个不含声音的信息帧记为 -1。
+    """
+    out, n, i = [], len(b), 0
+    if b[:3] == b'ID3' and n > 10:                          # 跳过开头的 ID3v2 标签
+        i = 10 + ((b[6] & 127) << 21 | (b[7] & 127) << 14 | (b[8] & 127) << 7 | (b[9] & 127))
+    while i + 4 <= n:
+        h = int.from_bytes(b[i:i + 4], 'big')
+        ver, bri, sri = h >> 19 & 3, h >> 12 & 15, h >> 10 & 3
+        if h >> 21 != 0x7ff or ver == 1 or h >> 17 & 3 != 1 or bri in (0, 15) or sri == 3:
+            i += 1
+            continue
+        v1, rate = ver == 3, _RATE[ver][sri]
+        size = (144 if v1 else 72) * _BITRATE[1 if v1 else 2][bri] * 1000 // rate + (h >> 9 & 1)
+        end = i + size
+        if end > n or (end + 2 <= n and (b[end] != 0xff or b[end + 1] & 0xe0 != 0xe0) and b[end:end + 3] != b'TAG'):
+            i += 1                                          # 后面接不上下一帧：这里只是碰巧长得像帧头
+            continue
+        mono = (h >> 6 & 3) == 3
+        s = i + 4 + (0 if h >> 16 & 1 else 2)               # 边信息的起点（带校验时多 2 个字节）
+        side = int.from_bytes(b[s:s + 32], 'big')
+        bits = lambda off, ln: side >> (256 - off - ln) & ((1 << ln) - 1)
+        first, step, count, length = (((18, 59, 2, 17) if mono else (20, 59, 4, 32)) if v1
+                                      else ((9, 63, 1, 9) if mono else (10, 63, 2, 17)))
+        loud = 0.0
+        for o in range(first, first + count * step, step):  # 每个颗粒、每个声道一组
+            data, big, gain = bits(o, 12), bits(o + 12, 9), bits(o + 21, 8)
+            t = o + (33 if v1 else 38)                      # "是否切换窗型"那一位；它决定后面码表编号放在哪
+            tabs = (bits(t + 4, 5), bits(t + 9, 5)) if bits(t, 1) else (bits(t + 1, 5), bits(t + 6, 5), bits(t + 11, 5))
+            if data:
+                loud = max(loud, 2.0 ** ((gain - 210) / 2.0)
+                           * (2 * big * max(_TOP[x] for x in tabs) ** (8 / 3.0) + min(576 - 2 * big, 4 * data)))
+        info = b[s + length:s + length + 4] in (b'Xing', b'Info')
+        out.append((i, size, -1 if info else loud, bits(0, 9 if v1 else 8), end - s - length, (1152 if v1 else 576) / rate))
+        i = end
+    return out
+
+
+def wav(b):
+    """16 位 PCM 的 WAV 文件 → (fmt 块, 声音数据的起点, 长度)；不是的话返回 None。"""
+    i, fmt = 12, b''
+    while b[:4] == b'RIFF' and b[8:12] == b'WAVE' and i + 8 <= len(b):
+        name, n = b[i:i + 4], struct.unpack('<I', b[i + 4:i + 8])[0]
+        if name == b'fmt ':
+            fmt = b[i + 8:i + 24]
+        elif name == b'data':
+            ok = len(fmt) == 16 and struct.unpack('<HHIIHH', fmt)[::5] == (1, 16)
+            return (fmt, i + 8, min(n, len(b) - i - 8) // 2 * 2) if ok else None
+        i += 8 + n + n % 2
+    return None
+
+
+def trim(b):
+    """去掉发音开头和结尾的静音（词典的发音前后各有 0.3 ～ 0.8 秒），这样开口快，几个词接着读也不会一顿一顿的。
+
+    MP3 不重新编码，只是整帧整帧地丢，而且只丢"响度上界"低于满刻度 40 分贝的帧——它们肯定是静音，实际还要轻得多。
+    有声音的部分前面多留 2 帧、后面多留 3 帧；拿不准就原样返回。
+    """
+    try:
+        w = wav(b)
+        if w:   # WAV：直接看采样值。比最响处低 40 分贝以上的算静音，有声音的部分前面多留 0.03 秒、后面多留 0.08 秒
+            fmt, at, n = w
+            a = array.array('h', b[at:at + n])
+            step = struct.unpack('<H', fmt[2:4])[0] * (struct.unpack('<I', fmt[4:8])[0] // 100)    # 0.01 秒有多少个采样值
+            peaks = [max(max(a[i:i + step]), -min(a[i:i + step])) for i in range(0, len(a), step)]
+            loud = [i for i, x in enumerate(peaks) if x > max(max(peaks) * 0.01, 16)]
+            data = a[max(loud[0] - 3, 0) * step:(loud[-1] + 9) * step].tobytes()
+            return b''.join((b'RIFF', struct.pack('<I', 36 + len(data)), b'WAVEfmt ', struct.pack('<I', 16), fmt,
+                             b'data', struct.pack('<I', len(data)), data))
+        fs = frames(b)
+        first = next(i for i, f in enumerate(fs) if f[2] >= 0)
+        sound = [i for i, f in enumerate(fs) if f[2] > 1e-4]
+        a, z = max(sound[0] - 2, first), min(sound[-1] + 4, len(fs))
+        need = fs[sound[0]][3] - sum(f[4] for f in fs[a:sound[0]])
+        while need > 0 and a > first:                       # 第一个有声音的帧往前借的那些数据所在的帧，得留着
+            a -= 1
+            need -= fs[a][4]
+        if a == first and z == len(fs) or z - a < 6:
+            return b
+        return b[fs[a][0]:fs[z - 1][0] + fs[z - 1][1]]
+    except Exception:
+        return b
+
+
+def seconds(path):
+    """一段发音（MP3 或 WAV 文件）大约多长（秒）。"""
+    try:
+        with open(path, 'rb') as f:
+            b = f.read()
+        w = wav(b)
+        if w:
+            return w[2] / float(struct.unpack('<I', w[0][8:12])[0])     # 数据的字节数 ÷ 每秒的字节数
+        return sum(x[5] for x in frames(b) if x[2] >= 0)
+    except Exception:
+        return 0.0
 
 
 # ───────────────────────── 各平台：弹窗 / 鼠标 / 取选中文本 / 播放 ─────────────────────────
@@ -181,6 +637,56 @@ def voice(q):
 #   sourced  True = events() 能报告每一次鼠标按下 / 松开，不会漏掉很快的轻点
 #   manual   True = 界面库收不到对弹窗的点击，由主逻辑根据全局的鼠标状态判断"点了喇叭"（macOS）
 #   after loop quit close | show hide say paint box | poll events grab | play stop
+
+def speaker(n, fg, bg):
+    """n×n 像素的喇叭，颜色 fg 画在 bg 上，带抗锯齿：每个像素取 4×4 个采样点，按盖住的比例混色。
+    → Tk 图片的 put() 要的格式。形状取自 Material Design 的 volume_up 图标（24 格的网格，图形占中间 18 格）。
+    整张图当作 30 格见方：缩放是 100%、150%、200% 时（n = 20、30、40），喇叭的几条直边正好落在像素的边界上，最清楚。"""
+    f, b = ([int(c[i:i + 2], 16) for i in (1, 3, 5)] for c in (fg, bg))
+    z, rows = 30.0 / n, []
+    for py in range(n):
+        row = []
+        for px in range(n):
+            hit = 0
+            for sy in range(4):
+                y = (py + sy / 4.0 + .125 - n / 2.0) * z + 12
+                for sx in range(4):
+                    x = (px + sx / 4.0 + .125 - n / 2.0) * z + 12
+                    if x <= 12:         # 喇叭本体：一个方块接一个梯形
+                        hit += (3 <= x <= 7 and 9 <= y <= 15) or (x > 7 and abs(y - 12) <= x - 4)
+                    elif x >= 14:       # 两道声波：圆心在 (12, 12) 的一块弓形和一段圆环
+                        d = ((x - 12) ** 2 + (y - 12) ** 2) ** .5
+                        hit += d <= 4.5 or 7 <= d <= 9
+            row.append('#%02x%02x%02x' % tuple(int(round(b[i] + (f[i] - b[i]) * hit / 16.0)) for i in range(3)))
+        rows.append('{' + ' '.join(row) + '}')
+    return ' '.join(rows)
+
+
+def chain(player, files):
+    """用外部播放器依次播放几个文件：一个 shell 带着它们，自成一个进程组，方便中途一起停掉。"""
+    return subprocess.Popen(['/bin/sh', '-c', 'for f; do %s "$f" || exit 1; done' % ' '.join(player), 'sh'] + files,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
+
+
+def unchain(proc):
+    if proc and proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def follow(ui, proc, n, began):
+    """等外部播放器播完，往日志里记一笔（排查"只读了一半"时用得上）。"""
+    code = proc.poll()
+    if code is None:
+        ui.after(100, lambda: follow(ui, proc, n, began))
+    elif code == 0:
+        log('played %d clips in %d ms' % (n, (time.monotonic() - began) * 1000))
+    elif code > 0:
+        log('play fail: player exit code %d' % code)
+
 
 class Linux:
     """GTK3（桌面版 Linux 自带的 python3-gi）。X11 有"主选区"：一选中文字就能知道选了什么。"""
@@ -203,19 +709,21 @@ class Linux:
         self.changed = False
         self.clip.connect('owner-change', lambda *a: setattr(self, 'changed', True))
 
+        pad = max(2, (ICON - 2) // 8)       # 图标四周的留白；默认大小下图标本身是 16 像素
         css = Gtk.CssProvider()
         css.load_from_data(('''
             .moerduo { background: #fff; border: 1px solid %s; }
-            .moerduo image { color: %s; padding: 7px; }
+            .moerduo image { color: %s; padding: %dpx; }
             .moerduo.on image { color: #fff; background: %s; }
-            .moerduo label { color: %s; padding: 5px 9px 5px 7px; font-size: 10pt; }
-        ''' % (EDGE, BLUE, BLUE, INK)).encode())
+            .moerduo label { color: %s; padding: %dpx 9px %dpx 7px; font-size: 10pt; }
+        ''' % (EDGE, BLUE, pad, BLUE, INK, pad, pad)).encode())
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, 800)
         win = self.win = Gtk.Window(type=Gtk.WindowType.POPUP)
         win.get_style_context().add_class('moerduo')
         win.set_keep_above(True)
         box = Gtk.Box()
         ico = Gtk.Image.new_from_icon_name('audio-volume-high-symbolic', Gtk.IconSize.MENU)
+        ico.set_pixel_size(ICON - 2 - 2 * pad)
         ico.set_valign(Gtk.Align.START)
         self.info = Gtk.Label(xalign=0)
         self.info.set_no_show_all(True)
@@ -228,6 +736,7 @@ class Linux:
         win.connect('enter-notify-event', lambda *a: app.prefetch())
         self.at, self.pin = (0, 0), False
         self.bin = self.proc = self.player = None
+        self.rest, self.count, self.began = [], 0, 0
 
     def after(self, ms, fn):
         self.GLib.timeout_add(ms, lambda: fn() and False)
@@ -257,12 +766,13 @@ class Linux:
             if y + h > g.y + g.height - 8:
                 y -= h + 28
         self.win.move(x, y)
+        return x, y
 
     def show(self, x, y, pin=False):
         self.at, self.pin = (x + 12, y + 16), pin
         self.info.hide()
         self.paint(False)
-        self._place()
+        log('popup at %d,%d icon %d' % (self._place() + (ICON,)))
         self.win.show_all()
 
     def hide(self):
@@ -291,7 +801,7 @@ class Linux:
     def events(self):
         return ()
 
-    def play(self, path):
+    def play(self, files):
         if self.bin is None and self.player is None:  # 首次播放时才加载：优先进程内 GStreamer，没有再找外部播放器
             try:
                 import gi
@@ -299,6 +809,11 @@ class Linux:
                 from gi.repository import Gst
                 Gst.init(None)
                 self.Gst, self.bin = Gst, Gst.ElementFactory.make('playbin')
+                bus = self.bin.get_bus()
+                bus.add_signal_watch()
+                bus.connect('message::eos', lambda *a: self._next(True))    # 一段播完，接着播下一段
+                bus.connect('message::error', lambda bus, m: (log('gst error: %s' % m.parse_error()[0].message),
+                                                              self._next()))
             except Exception:
                 self.bin = None
             if self.bin is None:
@@ -307,19 +822,29 @@ class Linux:
                                                 ['mpg123', '-q']) if shutil.which(p[0])), [])
         self.stop()
         if self.bin is not None:
-            self.bin.set_property('uri', self.GLib.filename_to_uri(path, None))
-            self.bin.set_state(self.Gst.State.PLAYING)
+            self.rest, self.count, self.began = list(files), 0, time.monotonic()
+            self._next()
         elif self.player:
-            self.proc = subprocess.Popen(self.player + [path], stdin=subprocess.DEVNULL,
-                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.proc = chain(self.player, files)
+            follow(self, self.proc, len(files), time.monotonic())
         else:
             return '没有可用的播放器，请安装 gstreamer1.0-plugins-good 或 ffmpeg'
 
+    def _next(self, ended=False):
+        self.bin.set_state(self.Gst.State.NULL)
+        self.count += ended
+        if self.rest:
+            self.bin.set_property('uri', self.GLib.filename_to_uri(self.rest.pop(0), None))
+            self.bin.set_state(self.Gst.State.PLAYING)
+        elif self.began:
+            log('played %d clips in %d ms' % (self.count, (time.monotonic() - self.began) * 1000))
+            self.began = 0
+
     def stop(self):
+        self.rest, self.began = [], 0
         if self.bin is not None:
             self.bin.set_state(self.Gst.State.NULL)
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+        unchain(self.proc)
         self.proc = None
 
 
@@ -336,25 +861,61 @@ class TkUI:
         root = self.root = tk.Tk()
         root.withdraw()
         root.report_callback_exception = lambda *e: log('tk error: ' + ''.join(traceback.format_exception(*e)))
-        k = max(1.0, root.winfo_fpixels('1i') / 96)     # 高分屏上把图标按比例放大
         pop = self.pop = tk.Toplevel(root, bg=EDGE, padx=1, pady=1)
         pop.withdraw()
         self.frameless(pop)
         pop.attributes('-topmost', True)
         box = tk.Frame(pop, bg='#ffffff')
         box.pack()
-        ico = self.ico = tk.Canvas(box, width=30 * k, height=30 * k, bg='#ffffff', highlightthickness=0, cursor='hand2')
+        self.zoom, self.n, self.on = 0, 0, False       # 当前的缩放比例、图标的像素边长、图标是不是"按下"的样子
+        ico = self.ico = self.icon(box)
         ico.grid(row=0, column=0, sticky='n')
-        ico.create_polygon([v * k for v in (7, 12, 11, 12, 16, 7, 16, 23, 11, 18, 7, 18)], fill=BLUE)
-        for a, b in ((13, 10), (11, 6)):
-            ico.create_arc(a * k, b * k, (34 - a) * k, (30 - b) * k, start=-55, extent=110,
-                           style='arc', outline=BLUE, width=2 * k)
-        self.info = tk.Label(box, bg='#ffffff', fg=INK, font=self.font, justify='left', anchor='w', padx=6, pady=5)
+        self.info = tk.Label(box, bg='#ffffff', fg=INK, justify='left', anchor='w')
         if not self.manual:
             for widget in (ico, self.info):
                 widget.bind('<ButtonRelease-1>', lambda e: app.click())
         pop.bind('<Enter>', lambda e: app.prefetch())
         self.at, self.pin = (0, 0), False
+        self.rescale(max(1.0, root.winfo_fpixels('1i') / 96))
+
+    def icon(self, box):
+        """喇叭图标。这里用画布画矢量图形：macOS 上自带抗锯齿，视网膜屏上也清楚。"""
+        return self.tk.Canvas(box, bg='#ffffff', highlightthickness=0, cursor='hand2')
+
+    def draw(self):
+        c, u = self.ico, self.n / 30.0
+        c.configure(width=self.n, height=self.n)
+        c.delete('all')
+        c.create_polygon([v * u for v in (7, 12, 11, 12, 16, 7, 16, 23, 11, 18, 7, 18)], fill=BLUE)
+        for a, b in ((13, 10), (11, 6)):
+            c.create_arc(a * u, b * u, (34 - a) * u, (30 - b) * u, start=-55, extent=110,
+                         style='arc', outline=BLUE, width=max(1.4, 2 * u))
+
+    def paint(self, on):
+        self.on = on
+        bg, fg = (BLUE, '#ffffff') if on else ('#ffffff', BLUE)
+        self.ico.configure(bg=bg)
+        for item in self.ico.find_all():
+            self.ico.itemconfigure(item, **{'fill' if self.ico.type(item) == 'polygon' else 'outline': fg})
+
+    def fontspec(self, k):
+        return self.font
+
+    def rescale(self, k):
+        """按缩放比例 k（1.0 = 100%）安排图标和文字的大小。"""
+        self.zoom, self.n = k, int(round((ICON - 2) * k))
+        self.draw()
+        self.paint(self.on)
+        self.info.configure(font=self.fontspec(k), padx=int(6 * k), pady=int(max(2, (ICON - 18) // 2) * k))
+
+    def scale(self, x, y, pin):
+        """这个位置所在的屏幕的缩放比例。"""
+        return self.zoom
+
+    def area(self):
+        """弹窗不能超出的范围 → (左, 上, 宽, 高)。"""
+        p = self.pop
+        return p.winfo_vrootx(), p.winfo_vrooty(), p.winfo_vrootwidth(), p.winfo_vrootheight()
 
     def frameless(self, win):
         win.overrideredirect(True)
@@ -382,17 +943,21 @@ class TkUI:
         if self.pin:
             x, y = self.corner(w, h)
         else:
-            x, y = self.at
-            x = max(p.winfo_vrootx(), min(x, p.winfo_vrootx() + p.winfo_vrootwidth() - w - 8))
-            if y + h > p.winfo_vrooty() + p.winfo_vrootheight() - 8:
-                y -= h + 28
+            (x, y), (ax, ay, aw, ah) = self.at, self.area()
+            x = max(ax, min(x, ax + aw - w - 8))
+            if y + h > ay + ah - 8:
+                y -= h + int(28 * self.zoom)
         p.geometry('+%d+%d' % (x, y))
+        return x, y
 
     def show(self, x, y, pin=False):
-        self.at, self.pin = (x + 12, y + 16), pin
+        k = self.scale(x, y, pin)
+        if k != self.zoom:
+            self.rescale(k)
+        self.at, self.pin = (x + int(12 * k), y + int(16 * k)), pin
         self.info.grid_forget()
         self.paint(False)
-        self._place()
+        log('popup at %d,%d icon %d' % (self._place() + (self.n + 2,)))
         self.reveal()
 
     def reveal(self):
@@ -407,12 +972,6 @@ class TkUI:
         self.info.configure(text=msg)
         self.info.grid(row=0, column=1, sticky='w')
         self._place()
-
-    def paint(self, on):
-        bg, fg = (BLUE, '#ffffff') if on else ('#ffffff', BLUE)
-        self.ico.configure(bg=bg)
-        for item in self.ico.find_all():
-            self.ico.itemconfigure(item, **{'fill' if self.ico.type(item) == 'polygon' else 'outline': fg})
 
     def box(self):
         p = self.pop
@@ -450,6 +1009,7 @@ class Windows(TkUI):
                 ('LoadCursorW', P, [P, P]), ('LoadIconW', P, [P, P]),
                 ('GetCursorInfo', w.BOOL, [P]), ('GetCursorPos', w.BOOL, [P]),
                 ('GetAsyncKeyState', ctypes.c_short, [I]), ('GetSystemMetrics', I, [I]),
+                ('MonitorFromPoint', P, [w.POINT, w.DWORD]), ('GetMonitorInfoW', w.BOOL, [P, P]),
                 ('keybd_event', None, [ctypes.c_ubyte, ctypes.c_ubyte, w.DWORD, P]),
                 ('GetClipboardSequenceNumber', w.DWORD, []),
                 ('OpenClipboard', w.BOOL, [P]), ('CloseClipboard', w.BOOL, []), ('EmptyClipboard', w.BOOL, []),
@@ -507,13 +1067,22 @@ class Windows(TkUI):
         self.vk, self.bits = (2, (4, 8)) if swapped else (1, (1, 2))
         self.evs = collections.deque()                      # 后台线程收到的按键事件，等主线程来取
         self.ri, self.hwnd, self.nid, self.src, self.WM_TASKBAR = RAWINPUT(), None, None, None, 0
+        self.opened = self.turn = 0                         # 播放：已经打开的音频数；每次开始 / 停止加一
 
+        # 声明"每块屏幕按各自的缩放比例自己画"：坐标才对得上，系统也不会把弹窗当成图片去拉伸（那样是糊的）
+        self.aware, self.mon = -1, None
         try:
-            ctypes.WinDLL('shcore').SetProcessDpiAwareness(1)   # 高分屏下坐标才对得上
+            sh = self.shcore = ctypes.WinDLL('shcore')
+            sh.GetProcessDpiAwareness.argtypes, sh.GetDpiForMonitor.argtypes = [P, P], [P, I, P, P]
+            sh.SetProcessDpiAwareness(2)
+            got = I(-1)
+            sh.GetProcessDpiAwareness(None, ctypes.byref(got))
+            self.aware = got.value
         except Exception:
             pass
         front = u.GetForegroundWindow()
         super().__init__(app)
+        log('dpi awareness %d scale %.2f' % (self.aware, self.zoom))
         self.root.update()
         if front and self._mine(u.GetForegroundWindow()):   # Tk 初始化时会把（看不见的）主窗口设成活动窗口：把焦点还回去
             u.SetForegroundWindow(front)
@@ -618,6 +1187,42 @@ class Windows(TkUI):
         return pid.value == os.getpid()
 
     # —— 弹窗 ——
+    def icon(self, box):
+        """Windows 上 Tk 画图形不带抗锯齿（斜边是锯齿，圆弧断断续续）：改用事先算好的位图。"""
+        self.imgs = {}
+        return self.tk.Label(box, bd=0, highlightthickness=0, padx=0, pady=0, bg='#ffffff', cursor='hand2')
+
+    def draw(self):
+        pass
+
+    def paint(self, on):
+        self.on = on
+        if (self.n, on) not in self.imgs:
+            img = self.imgs[self.n, on] = self.tk.PhotoImage(width=self.n, height=self.n)
+            img.put(speaker(self.n, *(('#ffffff', BLUE) if on else (BLUE, '#ffffff'))))
+        self.ico.configure(image=self.imgs[self.n, on])
+
+    def fontspec(self, k):
+        return self.font[0], -int(round(self.font[1] * 96 / 72.0 * k))     # 负数 = 以像素为单位
+
+    def scale(self, x, y, pin):
+        self.mon = self.u.MonitorFromPoint(self.w.POINT(0, 0) if pin else self.w.POINT(x, y), 1 if pin else 2)
+        dx, dy = self.w.UINT(), self.w.UINT()
+        if self.aware != 2 or self.shcore.GetDpiForMonitor(self.mon, 0, ctypes.byref(dx), ctypes.byref(dy)):
+            return self.zoom
+        return max(1.0, dx.value / 96.0)
+
+    def area(self):
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [('cbSize', self.w.DWORD), ('rcMonitor', self.w.RECT), ('rcWork', self.w.RECT),
+                        ('dwFlags', self.w.DWORD)]
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(mi)
+        if not (self.mon and self.u.GetMonitorInfoW(self.mon, ctypes.byref(mi))):
+            return super().area()
+        rc = mi.rcWork
+        return rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top
+
     def corner(self, w, h):
         rc = self.w.RECT()
         if not self.u.SystemParametersInfoW(0x30, 0, ctypes.byref(rc), 0) or not rc.right:   # 屏幕去掉任务栏后的区域
@@ -696,25 +1301,59 @@ class Windows(TkUI):
         return text
 
     # —— 播放 ——
-    def play(self, path):
-        self.stop()
-        for cmd in ('open "%s" type mpegvideo alias earimm' % path, 'set earimm time format milliseconds', 'play earimm'):
-            err = self.mci(cmd, None, 0, None)
-            if err and not cmd.startswith('set'):
-                buf = ctypes.create_unicode_buffer(256)
-                self.mm.mciGetErrorStringW(err, buf, 256)
-                return '%s %d %s' % (cmd.split()[0], err, buf.value)
-        self.root.after(400, self._probe)
+    def _mci(self, cmd):
+        """执行一条 MCI 命令 → (出错信息或 None, 返回的文字)。"""
+        buf = ctypes.create_unicode_buffer(128)
+        err = self.mci(cmd, buf, 128, None)
+        if not err:
+            return None, buf.value
+        self.mm.mciGetErrorStringW(err, buf, 128)
+        return '%s %d %s' % (cmd.split()[0], err, buf.value), ''
 
-    def _probe(self):
-        """开始播放后看一眼进度并记进日志：排查"点了没声音"时用得上。"""
-        buf = ctypes.create_unicode_buffer(64)
-        got = [buf.value if not self.mci('status earimm ' + what, buf, 64, None) else '?'
-               for what in ('mode', 'position', 'length')]
-        log('playing: mode=%s position=%s/%s' % tuple(got))
+    def play(self, files):
+        """依次播放几个文件：先全部打开，播完一个马上播下一个。"""
+        self.stop()
+        for i, path in enumerate(files):
+            err = self._mci('open "%s" type mpegvideo alias earimm%d' % (path, i))[0]
+            if err and path.endswith('.wav'):               # 个别发音是 WAV：万一上面那个播放组件不认，换系统自带的波形播放
+                err = self._mci('open "%s" type waveaudio alias earimm%d' % (path, i))[0]
+            if err:
+                self.stop()
+                return err if self.mm.waveOutGetNumDevs() else '这台电脑没有可用的声音输出设备'
+            self.opened = i + 1
+            self._mci('set earimm%d time format milliseconds' % i)
+        self.began = time.monotonic()
+        return self._start(0, self.turn)
+
+    def _start(self, i, turn):
+        err = self._mci('play earimm%d' % i)[0]
+        if not err:
+            self.root.after(30, lambda: self._watch(i, turn, False))
+        return err
+
+    def _watch(self, i, turn, probed):
+        if turn != self.turn:               # 已经被停掉，或者开始播别的了
+            return
+        mode, pos, length = (self._mci('status earimm%d %s' % (i, what))[1] for what in ('mode', 'position', 'length'))
+        if not probed and (mode != 'playing' or int(pos or 0) >= 120):
+            # 开始播放后看一眼进度并记进日志：排查"点了没声音"时用得上
+            log('playing: mode=%s position=%s/%s clip %d/%d' % (mode, pos, length, i + 1, self.opened))
+            probed = True
+        if mode == 'playing':
+            return self.root.after(30, lambda: self._watch(i, turn, probed))
+        if i + 1 < self.opened:
+            err = self._start(i + 1, turn)
+            if err:
+                log('play fail: ' + err)
+        else:
+            log('played %d clips in %d ms' % (self.opened, (time.monotonic() - self.began) * 1000))
+            self.stop()
 
     def stop(self):
-        self.mci('close earimm', None, 0, None)
+        self.turn += 1
+        for i in range(self.opened):
+            self.mci('close earimm%d' % i, None, 0, None)
+        self.opened = 0
 
     def close(self):
         self._tray(False)
@@ -740,6 +1379,12 @@ class Mac(TkUI):
             f = getattr(cg, name)
             f.restype, f.argtypes = res, args
         self.proc, self.mapped = None, False
+        self.sounds, self.turn, self.began = [], 0, 0
+        try:
+            self._cocoa()
+        except Exception:
+            self.oc = None
+            log('NSSound unavailable, will use afplay: ' + traceback.format_exc())
         self.env = dict(os.environ, LANG='en_US.UTF-8')
         self.count = self._count()
         super().__init__(app)
@@ -855,18 +1500,76 @@ class Mac(TkUI):
             log('modifier keys down after copy: %#x' % held)
         return text
 
-    def play(self, path):
+    # —— 播放 ——
+    def _cocoa(self):
+        """接上系统的 NSSound（经 Objective-C 运行时）。在本进程里播放：开口快，几段接着播时中间没有停顿；
+        而每段起一个 afplay 进程的话，段与段之间会停将近一秒。"""
+        P = ctypes.c_void_p
+        rt = ctypes.CDLL('/usr/lib/libobjc.A.dylib')
+        ctypes.CDLL('/System/Library/Frameworks/AppKit.framework/AppKit')
+        rt.objc_getClass.restype, rt.objc_getClass.argtypes = P, [ctypes.c_char_p]
+        rt.sel_registerName.restype, rt.sel_registerName.argtypes = P, [ctypes.c_char_p]
+
+        def send(res, *args):       # objc_msgSend 的参数表随用法而变：每种用法各建一个带类型的入口
+            return ctypes.CFUNCTYPE(res, P, P, *args)(('objc_msgSend', rt))
+        self.oc = {'obj': send(P), 'str': send(P, ctypes.c_char_p), 'file': send(P, P, ctypes.c_bool),
+                   'bool': send(ctypes.c_bool), 'void': send(None)}
+        self.sel = {n: rt.sel_registerName(n.encode()) for n in (
+            'alloc', 'stringWithUTF8String:', 'initWithContentsOfFile:byReference:', 'play', 'isPlaying', 'stop', 'release')}
+        self.NSSound, self.NSString = rt.objc_getClass(b'NSSound'), rt.objc_getClass(b'NSString')
+        if not (self.NSSound and self.NSString):
+            raise OSError('NSSound class not found')
+
+    def _sound(self, path):
+        oc, sel = self.oc, self.sel
+        name = oc['str'](self.NSString, sel['stringWithUTF8String:'], path.encode())
+        return oc['file'](oc['obj'](self.NSSound, sel['alloc']), sel['initWithContentsOfFile:byReference:'], name, True)
+
+    def play(self, files):
         self.stop()
-        self.proc = subprocess.Popen(['afplay', path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if self.oc:
+            try:
+                self.sounds = [x for x in map(self._sound, files) if x]
+                if len(self.sounds) == len(files):
+                    self.began = time.monotonic()
+                    return self._start(0, self.turn)
+                log('NSSound could not open %d of %d clips, using afplay' % (len(files) - len(self.sounds), len(files)))
+            except Exception:
+                log('NSSound error, using afplay: ' + traceback.format_exc())
+            self.stop()
+        self.proc = chain(['afplay'], files)
         try:
             code = self.proc.wait(0.15)     # 放不出来的话它会立刻退出
         except subprocess.TimeoutExpired:
-            return None
+            return follow(self, self.proc, len(files), time.monotonic())
         return 'afplay 退出码 %d' % code if code else None
 
+    def _start(self, i, turn):
+        if not self.oc['bool'](self.sounds[i], self.sel['play']):
+            self.stop()
+            return '系统没能播放这段音频'
+        self.root.after(20, lambda: self._watch(i, turn))
+
+    def _watch(self, i, turn):
+        if turn != self.turn:               # 已经被停掉，或者开始播别的了
+            return
+        if self.oc['bool'](self.sounds[i], self.sel['isPlaying']):
+            return self.root.after(20, lambda: self._watch(i, turn))
+        if i + 1 < len(self.sounds):
+            err = self._start(i + 1, turn)
+            if err:
+                log('play fail: ' + err)
+        else:
+            log('played %d clips in %d ms' % (len(self.sounds), (time.monotonic() - self.began) * 1000))
+            self.stop()
+
     def stop(self):
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+        self.turn += 1
+        for x in self.sounds:
+            self.oc['bool'](x, self.sel['stop'])
+            self.oc['void'](x, self.sel['release'])
+        self.sounds = []
+        unchain(self.proc)
         self.proc = None
 
 
@@ -878,7 +1581,8 @@ class App:
     def __init__(self, platform, todo):
         self.q = queue.Queue()                  # 后台线程取回来的发音 / 释义
         self.todo = todo                        # 别的线程要主线程做的事：'quit' / 'hello'
-        self.means, self.voices, self.busy = {}, {}, set()
+        self.means, self.voices, self.mts = {}, {}, {}  # 释义 / 发音 / 机翻（机翻以"拿去翻的原文"为键）
+        self.busy, self.failed = set(), set()           # 正在取的、没取成的（网络问题）：(种类, 文本)
         self.text = None        # 当前选中的文本；Windows / macOS 在点喇叭之前是 None
         self.want = None        # 等发音下载完要播放的文本
         self.bad = None         # (文本, 原因)：这段文本的发音没取到，或者没播出来
@@ -1001,33 +1705,52 @@ class App:
 
     def render(self):
         """按当前已拿到的数据刷新释义卡片。"""
-        t = self.text
-        if t in self.means:
-            m = self.means[t]
-            msg = ('/%s/\n' % m['phone'] if m['phone'] else '') + '\n'.join(m['lines'])
-        else:
-            msg = '…' if ('mean', t) in self.busy else '未找到释义'
-        self.os.say(wrap(msg + ('\n（%s）' % self.bad[1] if self.bad and self.bad[0] == t else '')))
+        t, out = self.text, []
+        m = self.means.get(t)
+        if m:
+            out.append('/%s/' % m['phone'] if m['phone'] else '')
+            if m['mt']:     # 机翻的结果晚一步到：先占一行
+                got = self.mts.get(m['mt'])
+                out.append(('机翻：' + got[0] if got[0] else got[1] and '（%s）' % got[1]) if got
+                           else '（机翻没连上）' if ('mt', m['mt']) in self.failed else '机翻：…')
+            out += m['lines']
+            out = [x for x in out if x]
+        if not out:
+            out = ['…' if ('mean', t) in self.busy else '查词失败，请检查网络' if ('mean', t) in self.failed
+                   else '词典里没有收录（多半是专有名词）' if m else '未找到释义']
+        if t in self.voices and not self.voices[t]['sure']:
+            out.append('（读音是按拼写推测的，仅供参考）')
+        if self.bad and self.bad[0] == t:
+            out.append('（%s）' % self.bad[1])
+        self.os.say(wrap('\n'.join(out)))
 
     # —— 取数据（后台线程）与播放 ——
     def prefetch(self):
         """鼠标移到喇叭上就开始取数据，点击时更快。"""
         t = self.text
-        if not t:
-            return
-        if t not in self.voices and os.path.exists(voice_path(t)):
-            self.voices[t] = voice_path(t)
-        for kind, fn, have in (('voice', voice, self.voices), ('mean', lookup, self.means)):
-            if t not in have and (kind, t) not in self.busy:
-                self.busy.add((kind, t))
-                threading.Thread(target=self.work, args=(kind, fn, t), daemon=True).start()
+        if t:
+            for kind, fn, have in (('voice', voice, self.voices), ('mean', lookup, self.means)):
+                if t not in have:
+                    self.fetch(kind, fn, t)
+
+    def fetch(self, kind, fn, text):
+        if (kind, text) not in self.busy:
+            self.busy.add((kind, text))
+            self.failed.discard((kind, text))
+            threading.Thread(target=self.work, args=(kind, fn, text), daemon=True).start()
 
     def work(self, kind, fn, text):
         try:
             res = fn(text)
-        except Exception:
-            res = None
+        except Exception as e:
+            res = e
         self.q.put((kind, text, res))
+
+    def machine(self):
+        """当前这段文本的释义需要机翻，而且已经点过喇叭了：去翻。（只是鼠标移上去的时候不翻，免得白白用掉额度）"""
+        mt = (self.means.get(self.text) or {}).get('mt')
+        if mt and self.clicked and mt not in self.mts:
+            self.fetch('mt', translate, mt)
 
     def click(self):
         if self.note:
@@ -1045,6 +1768,7 @@ class App:
         t = self.text
         self.clicked, self.bad, self.keep = True, None, 20
         self.prefetch()
+        self.machine()
         self.render()
         if t in self.voices:
             self.speak(t)
@@ -1053,8 +1777,9 @@ class App:
             self.os.paint(True)
 
     def speak(self, t):
-        err = self.os.play(self.voices[t])
-        log('play ' + ('fail: ' + err if err else 'ok'))
+        files = [os.path.join(VOICE, f) for f in self.voices[t]['files']]
+        err = self.os.play(files)
+        log('play ' + ('fail: ' + err if err else 'ok %d clips %d ms' % (len(files), sum(map(seconds, files)) * 1000)))
         if err:
             self.bad = (t, '播放失败：' + err)
             self.os.paint(False)
@@ -1063,22 +1788,32 @@ class App:
         self.os.after(900, lambda: self.want is None and self.os.paint(False))
 
     def done(self, kind, text, res):
-        log('%s %s' % (kind, 'ok' if res else 'none'))
-        if kind == 'mean':
-            if res:
-                self.means[text] = res
+        if isinstance(res, Exception):
+            log('%s error %s' % (kind, type(res).__name__))
+            self.failed.add((kind, text))
+        elif kind == 'mean':
+            log('mean %s%s' % ('ok' if res['lines'] else 'none', ' +mt' if res['mt'] else ''))
+            self.means[text] = res
+        elif kind == 'mt':
+            log('mt %s' % ('ok' if res[0] else 'none ' + res[1]))
+            self.mts[text] = res
         else:
+            log('voice %s' % ('ok %d clips%s%s' % (len(res['files']), '' if res['sure'] else ' unsure',
+                                                   ' wav' if any(f.endswith('.wav') for f in res['files']) else '')
+                              if res else 'none'))
             if res:
                 self.voices[text] = res
-            if text == self.want:
-                self.want = None
-                if res:
-                    self.speak(text)
-                else:
-                    self.bad = (text, '发音获取失败，请检查网络')
-                    self.os.paint(False)
-        if text == self.text and self.clicked and self.visible:
-            self.render()
+        if kind == 'voice' and text == self.want:
+            self.want = None
+            if text in self.voices:
+                self.speak(text)
+            else:
+                self.bad = (text, '发音获取失败，请检查网络')
+                self.os.paint(False)
+        if self.text is not None and self.clicked and self.visible:
+            if text == self.text or kind == 'mt':
+                self.machine()
+                self.render()
 
 
 # ───────────────────────── 启动 ─────────────────────────
